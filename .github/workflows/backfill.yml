@@ -20,10 +20,11 @@ jobs:
           YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
           YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
           INGEST_URL: ${{ secrets.INGEST_URL }}
+          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
         run: |
           if (Test-Path ./backfill.ps1) {
             Write-Host "Found backfill.ps1 — running"
-            ./backfill.ps1 -IngestUrl "${{ env.INGEST_URL }}" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN"
+            ./backfill.ps1 -IngestUrl "${{ env.INGEST_URL }}" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID"
           } else {
             Write-Host "No backfill.ps1 found in repository; nothing to run."
           }

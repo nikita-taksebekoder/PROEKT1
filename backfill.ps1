@@ -46,7 +46,12 @@ if (-not $CompanyId) { Write-Error 'CompanyId is required (param or env YCLIENTS
 function Invoke-YClientsGet {
   param($url)
   $headers = @{ 'Accept' = 'application/vnd.yclients.v2+json' }
-  if ($PartnerToken) { $headers['Authorization'] = "Bearer $PartnerToken" + (if ($UserToken) { ", User $UserToken" } else { '' }) }
+  if ($PartnerToken) {
+    # Build Authorization header safely (avoid inline if expression which isn't valid here)
+    $suffix = ''
+    if ($UserToken) { $suffix = ", User $UserToken" }
+    $headers['Authorization'] = "Bearer $PartnerToken$suffix"
+  }
   try {
     if ($InsecureSkipSsl) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
     $r = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
