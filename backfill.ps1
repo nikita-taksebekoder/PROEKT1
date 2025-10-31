@@ -105,7 +105,7 @@ function Invoke-YClientsGet {
     if ($hdr.ContainsKey('Authorization')) { $maskedAuth = & $mask $hdr['Authorization'] }
     $maskedXUser = $null
     if ($hdr.ContainsKey('X-User-Token')) { $maskedXUser = & $mask $hdr['X-User-Token'] }
-  Write-Host "Attempt #$attemptIndex: Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
+  Write-Host "Attempt #${attemptIndex}: Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
     try {
       # Use Invoke-WebRequest to capture status and body for richer diagnostics
       $response = Invoke-WebRequest -Uri $url -Headers $hdr -Method Get -ErrorAction SilentlyContinue -UseBasicParsing
