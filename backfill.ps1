@@ -80,10 +80,21 @@ function Invoke-YClientsGet {
     $attemptHeaders += @{ 'Accept' = $accept; 'X-Api-Key' = $PartnerToken }
   }
 
+  # Try header-only combinations and swapped roles
+  if ($PartnerToken -and $UserToken) {
+    $attemptHeaders += @{ 'Accept' = $accept; 'X-Partner-Token' = $PartnerToken; 'X-User-Token' = $UserToken }
+    # try user in Authorization and partner as X-Partner-Token
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "Bearer $UserToken"; 'X-Partner-Token' = $PartnerToken }
+  }
+  if ($PartnerToken) { $attemptHeaders += @{ 'Accept' = $accept; 'X-Partner-Token' = $PartnerToken } }
+  if ($UserToken) { $attemptHeaders += @{ 'Accept' = $accept; 'X-User-Token' = $UserToken } }
+
   if ($InsecureSkipSsl) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
 
   $lastErr = $null
+  $attemptIndex = 0
   foreach ($hdr in $attemptHeaders) {
+    $attemptIndex++
     # Log attempt with masked tokens
     $mask = {
       param($s)
@@ -94,7 +105,7 @@ function Invoke-YClientsGet {
     if ($hdr.ContainsKey('Authorization')) { $maskedAuth = & $mask $hdr['Authorization'] }
     $maskedXUser = $null
     if ($hdr.ContainsKey('X-User-Token')) { $maskedXUser = & $mask $hdr['X-User-Token'] }
-    Write-Host "Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
+  Write-Host "Attempt #$attemptIndex: Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
     try {
       # Use Invoke-WebRequest to capture status and body for richer diagnostics
       $response = Invoke-WebRequest -Uri $url -Headers $hdr -Method Get -ErrorAction SilentlyContinue -UseBasicParsing
