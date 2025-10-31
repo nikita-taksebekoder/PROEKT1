@@ -45,21 +45,59 @@ if (-not $CompanyId) { Write-Error 'CompanyId is required (param or env YCLIENTS
 
 function Invoke-YClientsGet {
   param($url)
-  $headers = @{ 'Accept' = 'application/vnd.yclients.v2+json' }
+  # Try multiple header formats to accommodate YCLIENTS requirements. Mask tokens in logs.
+  $accept = 'application/vnd.yclients.v2+json'
+  $attemptHeaders = @()
+
+  # 1) Authorization: Bearer <partner>
   if ($PartnerToken) {
-    # Build Authorization header safely (avoid inline if expression which isn't valid here)
-    $suffix = ''
-    if ($UserToken) { $suffix = ", User $UserToken" }
-    $headers['Authorization'] = "Bearer $PartnerToken$suffix"
+    $h = @{ 'Accept' = $accept; 'Authorization' = "Bearer $PartnerToken" }
+    $attemptHeaders += $h
+  } else {
+    $attemptHeaders += @{ 'Accept' = $accept }
   }
-  try {
-    if ($InsecureSkipSsl) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
-    $r = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
-    return $r
-  } catch {
-    Write-Error "YCLIENTS fetch failed: $($_.Exception.Message)"
-    return $null
+
+  # 2) Authorization: Bearer <partner> + X-User-Token: <user> (common pattern)
+  if ($PartnerToken -and $UserToken) {
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "Bearer $PartnerToken"; 'X-User-Token' = $UserToken }
   }
+
+  # 3) Authorization: Bearer <partner>, User <user> (legacy/combined) - keep as fallback
+  if ($PartnerToken -and $UserToken) {
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "Bearer $PartnerToken, User $UserToken" }
+  }
+
+  # 4) User only (unlikely) - try as last resort
+  if ($UserToken) {
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "User $UserToken" }
+  }
+
+  if ($InsecureSkipSsl) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+
+  $lastErr = $null
+  foreach ($hdr in $attemptHeaders) {
+    # Log attempt with masked tokens
+    $mask = {
+      param($s)
+      if (-not $s) { return '' }
+      return ($s -replace ".{4}.*(.{4})$","****$1")
+    }
+    $maskedAuth = $null
+    if ($hdr.ContainsKey('Authorization')) { $maskedAuth = & $mask $hdr['Authorization'] }
+    $maskedXUser = $null
+    if ($hdr.ContainsKey('X-User-Token')) { $maskedXUser = & $mask $hdr['X-User-Token'] }
+    Write-Host "Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
+    try {
+      $r = Invoke-RestMethod -Uri $url -Headers $hdr -Method Get -ErrorAction Stop
+      return $r
+    } catch {
+      $lastErr = $_.Exception.Message
+      Write-Host "Attempt failed: $lastErr"
+    }
+  }
+
+  Write-Error "YCLIENTS fetch failed after ${($attemptHeaders.Count)} attempts: $lastErr"
+  return $null
 }
 
 function Post-AdminImport {
