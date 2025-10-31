@@ -88,11 +88,20 @@ function Invoke-YClientsGet {
     if ($hdr.ContainsKey('X-User-Token')) { $maskedXUser = & $mask $hdr['X-User-Token'] }
     Write-Host "Trying YCLIENTS GET with Authorization='$maskedAuth' X-User-Token='$maskedXUser'"
     try {
-      $r = Invoke-RestMethod -Uri $url -Headers $hdr -Method Get -ErrorAction Stop
-      return $r
+      # Use Invoke-WebRequest to capture status and body for richer diagnostics
+      $response = Invoke-WebRequest -Uri $url -Headers $hdr -Method Get -ErrorAction SilentlyContinue -UseBasicParsing
+      if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+        # parse JSON body if possible
+        try { return ($response.Content | ConvertFrom-Json) } catch { return $response.Content }
+      } else {
+        $code = $response.StatusCode
+        $body = $response.Content
+        Write-Host "Attempt failed: HTTP $code - $body"
+        $lastErr = "HTTP $code - $body"
+      }
     } catch {
       $lastErr = $_.Exception.Message
-      Write-Host "Attempt failed: $lastErr"
+      Write-Host "Attempt exception: $lastErr"
     }
   }
 
