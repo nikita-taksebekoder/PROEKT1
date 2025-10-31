@@ -72,6 +72,14 @@ function Invoke-YClientsGet {
     $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "User $UserToken" }
   }
 
+  # Additional partner header formats to try
+  if ($PartnerToken) {
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "Partner $PartnerToken" }
+    $attemptHeaders += @{ 'Accept' = $accept; 'Authorization' = "Token $PartnerToken" }
+    $attemptHeaders += @{ 'Accept' = $accept; 'X-Partner-Token' = $PartnerToken }
+    $attemptHeaders += @{ 'Accept' = $accept; 'X-Api-Key' = $PartnerToken }
+  }
+
   if ($InsecureSkipSsl) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
 
   $lastErr = $null
