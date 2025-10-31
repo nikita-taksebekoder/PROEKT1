@@ -1,0 +1,28 @@
+name: Backfill YCLIENTS reviews
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # run hourly by default (you can change)
+    - cron: '0 * * * *'
+
+jobs:
+  backfill:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run backfill script if present
+        shell: pwsh
+        env:
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
+          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+        run: |
+          if (Test-Path ./backfill.ps1) {
+            Write-Host "Found backfill.ps1 — running"
+            ./backfill.ps1 -IngestUrl "${{ env.INGEST_URL }}" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN"
+          } else {
+            Write-Host "No backfill.ps1 found in repository; nothing to run."
+          }
