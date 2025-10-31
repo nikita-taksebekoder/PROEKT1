@@ -1,3 +1,36 @@
+# Build artifacts
+/build/
+
+# ESP-IDF & toolchain outputs
+*.elf
+*.bin
+*.map
+*.hex
+
+# SDK and generated config
+/sdkconfig
+/sdkconfig.old
+
+# Logs and temporary
+/output.log
+*.log
+*.tmp
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# Managed components (check if you need to keep any)
+/components/esp_littlefs/
 node_modules/
 dist/
 .env
