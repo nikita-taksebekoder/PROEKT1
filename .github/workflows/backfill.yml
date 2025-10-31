@@ -19,6 +19,7 @@ jobs:
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
           YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
           YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+          INGEST_URL: ${{ secrets.INGEST_URL }}
         run: |
           if (Test-Path ./backfill.ps1) {
             Write-Host "Found backfill.ps1 — running"
