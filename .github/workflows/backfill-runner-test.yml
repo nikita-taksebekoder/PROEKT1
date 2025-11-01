@@ -1,0 +1,28 @@
+name: Backfill runner test
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run-backfill:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run backfill (safe test)
+        shell: pwsh
+        env:
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
+          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
+        run: |
+          Write-Output 'Running backfill.ps1 safe test: page=1 batch=1'
+          if (Test-Path ./backfill.ps1) {
+            ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 1 -BatchSize 1
+          } else {
+            Write-Error 'backfill.ps1 not found in repo'
+            exit 1
+          }
