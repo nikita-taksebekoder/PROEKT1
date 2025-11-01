@@ -1,0 +1,77 @@
+name: YCLIENTS diagnostic
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: YCLIENTS diagnostic (safe, non-destructive)
+        shell: pwsh
+        env:
+          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
+          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
+        run: |
+          Write-Output '=== YCLIENTS diagnostic starting ==='
+          $mask = { param($s) if(-not $s){''} elseif ($s.Length -le 8) { '****' + $s.Substring([Math]::Max(0,$s.Length-4)) } else { $s.Substring(0,4) + '****' + $s.Substring($s.Length-4) } }
+
+          function Show-Info($name, $val) {
+            if (-not $val) { Write-Output "$name: <empty>"; return }
+            $trimmed = $val.Trim()
+            $b = [System.Text.Encoding]::UTF8.GetBytes($trimmed)
+            $hex = ($b | ForEach-Object { $_.ToString('x2') }) -join ''
+            $first = $hex.Substring(0, [Math]::Min(80, $hex.Length))
+            $last = $hex.Substring([Math]::Max(0, $hex.Length-80))
+            Write-Output "$name: masked=$(& $mask $trimmed) length=$($b.Length) firstHex=$first lastHex=$last containsCR=$([bool]($b -contains 0x0d)) containsLF=$([bool]($b -contains 0x0a))"
+          }
+
+          Show-Info 'YCLIENTS_PARTNER_TOKEN' $env:YCLIENTS_PARTNER_TOKEN
+          Show-Info 'YCLIENTS_USER_TOKEN' $env:YCLIENTS_USER_TOKEN
+          Show-Info 'YCLIENTS_COMPANY_ID' $env:YCLIENTS_COMPANY_ID
+
+          $url = "https://api.yclients.com/api/v1/comments/$($env:YCLIENTS_COMPANY_ID)/?page=1&count=1"
+          Write-Output "Target URL: $url"
+
+          function Try-Get($headers) {
+            try {
+              $client = New-Object System.Net.Http.HttpClient
+              $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
+              foreach ($k in $headers.Keys) { $null = $req.Headers.TryAddWithoutValidation($k, $headers[$k]) }
+              $resp = $client.SendAsync($req).Result
+              $code = [int]$resp.StatusCode
+              $body = $resp.Content.ReadAsStringAsync().Result
+              Write-Output "-> Headers: $(( $headers.Keys | ForEach-Object { "{0}='{1}'" -f $_, (& $mask $headers[$_]) }) -join ', ')"
+              Write-Output "-> HTTP $code"
+              if ($body) { if ($body.Length -gt 800) { Write-Output ($body.Substring(0,800) + '... (truncated)') } else { Write-Output $body } }
+            } catch {
+              Write-Output "-> Exception: $($_.Exception.Message)"
+            }
+          }
+
+          # 1) Combined Authorization: Bearer partner, User user
+          if ($env:YCLIENTS_PARTNER_TOKEN -and $env:YCLIENTS_USER_TOKEN) {
+            $hdr = @{ 'Authorization' = "Bearer $($env:YCLIENTS_PARTNER_TOKEN), User $($env:YCLIENTS_USER_TOKEN)"; 'Accept' = 'application/vnd.yclients.v2+json' }
+            Write-Output '--- Test: combined Authorization header ---'
+            Try-Get $hdr
+          } else { Write-Output 'Skipping combined test (missing tokens)' }
+
+          # 2) Authorization + X-User-Token
+          if ($env:YCLIENTS_PARTNER_TOKEN -and $env:YCLIENTS_USER_TOKEN) {
+            $hdr = @{ 'Authorization' = "Bearer $($env:YCLIENTS_PARTNER_TOKEN)"; 'X-User-Token' = $env:YCLIENTS_USER_TOKEN; 'Accept' = 'application/vnd.yclients.v2+json' }
+            Write-Output '--- Test: Authorization + X-User-Token header ---'
+            Try-Get $hdr
+          } else { Write-Output 'Skipping Auth+X-User test (missing tokens)' }
+
+          # 3) Partner-only Bearer
+          if ($env:YCLIENTS_PARTNER_TOKEN) {
+            $hdr = @{ 'Authorization' = "Bearer $($env:YCLIENTS_PARTNER_TOKEN)"; 'Accept' = 'application/vnd.yclients.v2+json' }
+            Write-Output '--- Test: Partner-only Authorization header ---'
+            Try-Get $hdr
+          } else { Write-Output 'Skipping partner-only test (missing partner token)' }
+
+          Write-Output '=== YCLIENTS diagnostic finished ==='
