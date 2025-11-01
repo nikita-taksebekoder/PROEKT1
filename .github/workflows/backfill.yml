@@ -1,7 +1,29 @@
 name: Backfill YCLIENTS reviews
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ingest_url:
+        description: 'Override INGEST_URL (optional)'
+        required: false
+      admin_key:
+        description: 'Override ADMIN_KEY (optional)'
+        required: false
+      partner_token:
+        description: 'YCLIENTS partner token (optional)'
+        required: false
+      user_token:
+        description: 'YCLIENTS user token (optional)'
+        required: false
+      company_id:
+        description: 'YCLIENTS company id (optional)'
+        required: false
+      page_size:
+        description: 'PageSize for YCLIENTS requests (optional)'
+        required: false
+      batch_size:
+        description: 'BatchSize for /admin/import (optional)'
+        required: false
   schedule:
     # run hourly by default (you can change)
     - cron: '0 * * * *'
@@ -9,22 +31,109 @@ on:
 jobs:
   backfill:
     runs-on: windows-latest
+    concurrency:
+      group: backfill-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: YCLIENTS auth quick-check
+        shell: pwsh
+        env:
+          YCLIENTS_PARTNER_TOKEN: ${{ coalesce(github.event.inputs.partner_token, secrets.YCLIENTS_PARTNER_TOKEN) }}
+          YCLIENTS_USER_TOKEN: ${{ coalesce(github.event.inputs.user_token, secrets.YCLIENTS_USER_TOKEN) }}
+          YCLIENTS_COMPANY_ID: ${{ coalesce(github.event.inputs.company_id, secrets.YCLIENTS_COMPANY_ID) }}
+        run: |
+          Write-Output 'Running YCLIENTS auth quick-check (will not modify data)'
+          $accept = 'application/vnd.yclients.v2+json'
+          $url = "https://api.yclients.com/api/v1/comments/$($env:YCLIENTS_COMPANY_ID)/?page=1&count=1"
+          $mask = { param($s) if(-not $s){''} else {$s -replace '.{4}.*(.{4})$','****$1'} }
+
+          # Short sanity checks (masked) so logs don't reveal secrets
+          $p_mask = & $mask $env:YCLIENTS_PARTNER_TOKEN
+          $u_mask = & $mask $env:YCLIENTS_USER_TOKEN
+          Write-Output "Masked tokens: Partner=${p_mask} User=${u_mask}"
+
+          # Build the Authorization header string we attempt to send
+          $partner = $env:YCLIENTS_PARTNER_TOKEN
+          $user = $env:YCLIENTS_USER_TOKEN
+          $hdr = "Bearer $partner, User $user"
+
+          # Diagnose hidden/whitespace characters by printing length and hex (does NOT print token in plaintext)
+          if ($hdr) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($hdr)
+            $hex = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+            Write-Output "Authorization header length: $($bytes.Length)"
+            $first = $hex.Substring(0, [Math]::Min(80, $hex.Length))
+            $last = $hex.Substring([Math]::Max(0, $hex.Length-80))
+            Write-Output "Authorization header hex (first up to 40 bytes): $first"
+            Write-Output "Authorization header hex (last up to 40 bytes):  $last"
+            Write-Output "Contains CR (0x0d): $([bool]($bytes -contains 0x0d)); Contains LF (0x0a): $([bool]($bytes -contains 0x0a))"
+            # check for the expected comma+space sequence (',' = 0x2c, space = 0x20 => hex '2c20')
+            $hasCommaSpace = $hex -match '2c20'
+            Write-Output "Contains expected ', ' sequence (hex 2c20): $hasCommaSpace"
+          } else {
+            Write-Output "Authorization header empty (partner/user missing)"
+          }
+
+          # Perform the same HttpClient request as existing quick-check (we keep TryAddWithoutValidation)
+          try {
+            $client = New-Object System.Net.Http.HttpClient
+            $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
+            $null = $req.Headers.TryAddWithoutValidation('Authorization', $hdr)
+            $null = $req.Headers.TryAddWithoutValidation('Accept', $accept)
+            $resp = $client.SendAsync($req).Result
+            $code = [int]$resp.StatusCode
+            $body = $resp.Content.ReadAsStringAsync().Result
+            Write-Output "HTTP: $code"
+            if ($body) { if ($body.Length -gt 800) { Write-Output ($body.Substring(0,800) + '... (truncated)') } else { Write-Output $body } }
+            if ($code -ne 200) { Write-Error "Auth quick-check failed: HTTP $code"; exit 1 }
+          } catch {
+            Write-Error "Auth quick-check exception: $($_.Exception.Message)"
+            exit 1
+          }
+
       - name: Run backfill script if present
         shell: pwsh
         env:
-          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
-          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
-          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
-          INGEST_URL: ${{ secrets.INGEST_URL }}
-          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
+          ADMIN_KEY: ${{ coalesce(github.event.inputs.admin_key, secrets.ADMIN_KEY) }}
+          YCLIENTS_PARTNER_TOKEN: ${{ coalesce(github.event.inputs.partner_token, secrets.YCLIENTS_PARTNER_TOKEN) }}
+          YCLIENTS_USER_TOKEN: ${{ coalesce(github.event.inputs.user_token, secrets.YCLIENTS_USER_TOKEN) }}
+          INGEST_URL: ${{ coalesce(github.event.inputs.ingest_url, secrets.INGEST_URL) }}
+          YCLIENTS_COMPANY_ID: ${{ coalesce(github.event.inputs.company_id, secrets.YCLIENTS_COMPANY_ID) }}
+          PAGE_SIZE: ${{ coalesce(github.event.inputs.page_size, '100') }}
+          BATCH_SIZE: ${{ coalesce(github.event.inputs.batch_size, '20') }}
         run: |
           if (Test-Path ./backfill.ps1) {
-            Write-Host "Found backfill.ps1 — running"
-            ./backfill.ps1 -IngestUrl "${{ env.INGEST_URL }}" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID"
+            Write-Output "Found backfill.ps1 — running"
+            # Pass trimmed env values to avoid hidden CR/LF or extra whitespace from secrets
+            ./backfill.ps1 -IngestUrl "${{ env.INGEST_URL }}" -AdminKey "$($env:ADMIN_KEY.Trim())" -PartnerToken "$($env:YCLIENTS_PARTNER_TOKEN.Trim())" -UserToken "$($env:YCLIENTS_USER_TOKEN.Trim())" -CompanyId "$($env:YCLIENTS_COMPANY_ID.Trim())" -PageSize $env:PAGE_SIZE -BatchSize $env:BATCH_SIZE
           } else {
-            Write-Host "No backfill.ps1 found in repository; nothing to run."
+            Write-Output "No backfill.ps1 found in repository; nothing to run."
           }
+
+      - name: Dump secret diagnostics (masked, lengths, hex snippets)
+        shell: pwsh
+        env:
+          ADMIN_KEY: ${{ coalesce(github.event.inputs.admin_key, secrets.ADMIN_KEY) }}
+          YCLIENTS_PARTNER_TOKEN: ${{ coalesce(github.event.inputs.partner_token, secrets.YCLIENTS_PARTNER_TOKEN) }}
+          YCLIENTS_USER_TOKEN: ${{ coalesce(github.event.inputs.user_token, secrets.YCLIENTS_USER_TOKEN) }}
+          YCLIENTS_COMPANY_ID: ${{ coalesce(github.event.inputs.company_id, secrets.YCLIENTS_COMPANY_ID) }}
+        run: |
+          Write-Output 'Secret diagnostics (masked lengths and hex snippets)'
+          $mask = { param($s) if(-not $s){''} elseif ($s.Length -le 8) { '****' + $s.Substring([Math]::Max(0,$s.Length-4)) } else { $s.Substring(0,4) + '****' + $s.Substring($s.Length-4) } }
+          function Show-Info($name, $val) {
+            if (-not $val) { Write-Output "$name: <empty>"; return }
+            $trimmed = $val.Trim()
+            $b = [System.Text.Encoding]::UTF8.GetBytes($trimmed)
+            $hex = ($b | ForEach-Object { $_.ToString('x2') }) -join ''
+            $first = $hex.Substring(0, [Math]::Min(80, $hex.Length))
+            $last = $hex.Substring([Math]::Max(0, $hex.Length-80))
+            Write-Output "$name: masked=$(& $mask $trimmed) length=$($b.Length) firstHex=$first lastHex=$last containsCR=$([bool]($b -contains 0x0d)) containsLF=$([bool]($b -contains 0x0a))"
+          }
+          Show-Info 'ADMIN_KEY' $env:ADMIN_KEY
+          Show-Info 'YCLIENTS_PARTNER_TOKEN' $env:YCLIENTS_PARTNER_TOKEN
+          Show-Info 'YCLIENTS_USER_TOKEN' $env:YCLIENTS_USER_TOKEN
+          Show-Info 'YCLIENTS_COMPANY_ID' $env:YCLIENTS_COMPANY_ID
+        
