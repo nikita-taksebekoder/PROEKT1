@@ -31,8 +31,9 @@ jobs:
           Write-Output "Payload length: $($payload.Length) chars"
 
           try {
-            Write-Output "Posting to $env:INGEST_URL"
-            $resp = Invoke-RestMethod -Uri $env:INGEST_URL -Method Post -Headers @{ 'X-Admin-Key' = $env:ADMIN_KEY; 'Content-Type' = 'application/json' } -Body $payload -ErrorAction Stop
+              $uri = "$($env:INGEST_URL.TrimEnd('/'))/admin/import"
+              Write-Output "Posting to $uri"
+              $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers @{ 'X-Admin-Key' = $env:ADMIN_KEY; 'Content-Type' = 'application/json' } -Body $payload -ErrorAction Stop
             Write-Output "HTTP request succeeded. Response (as JSON):"
             $resp | ConvertTo-Json -Depth 10 | Write-Output
             $resp | ConvertTo-Json -Depth 10 | Out-File -FilePath import-response.json -Encoding Utf8
