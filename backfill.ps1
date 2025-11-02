@@ -40,7 +40,8 @@ param(
   [switch]$ServerSideRating,
   [switch]$DryRun,
   # Minimum text length to consider a comment a real review. Set to 0 to disable.
-  [int]$TextMinLength = 3,
+  # Default = 1: exclude comments with empty text by default (user requested)
+  [int]$TextMinLength = 1,
   # Exclude comments authored by masters (type == 1). Set to $false to include.
   [switch]$ExcludeMasterComments,
   [switch]$SyncDeleteMissing,
