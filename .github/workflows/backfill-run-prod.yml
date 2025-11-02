@@ -20,15 +20,15 @@ jobs:
           YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
         run: |
           Write-Output 'Running controlled backfill (production import): MaxPages=50 BatchSize=100 PageSize=100'
-          if (Test-Path ./backfill.ps1) {
-            pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./backfill.ps1 \
-              -IngestUrl "$env:INGEST_URL" \
-              -AdminKey "$env:ADMIN_KEY" \
-              -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" \
-              -UserToken "$env:YCLIENTS_USER_TOKEN" \
-              -CompanyId "$env:YCLIENTS_COMPANY_ID" \
-              -PageSize 100 -BatchSize 100 -MaxPages 50 -OnlyReviews:$true -ExcludeMasterComments -TextMinLength 20
-          } else {
-            Write-Error 'backfill.ps1 not found in repo'
-            exit 1
-          }
+            if (-not $env:ADMIN_KEY -or -not $env:INGEST_URL) {
+              Write-Error 'Required secrets ADMIN_KEY or INGEST_URL are not set. Aborting to avoid unauthorized or misdirected import.'
+              exit 1
+            }
+
+            if (Test-Path ./backfill.ps1) {
+              Write-Output 'Invoking ./backfill.ps1 with provided secrets and parameters'
+              & ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 100 -BatchSize 100 -MaxPages 50 -OnlyReviews:$true -ExcludeMasterComments -TextMinLength 20
+            } else {
+              Write-Error 'backfill.ps1 not found in repo'
+              exit 1
+            }
