@@ -1,0 +1,49 @@
+name: import-test-payload
+
+on:
+  workflow_dispatch:
+
+jobs:
+  import:
+    name: Import test payload to staging
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show files (debug)
+        run: dir -File -Force | Out-String | Write-Output
+        shell: pwsh
+
+      - name: Import test payload
+        shell: pwsh
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+        run: |
+          Write-Output "Reading payload file..."
+          $payloadPath = './test-import-5.json'
+          if (-not (Test-Path $payloadPath)) {
+            Write-Error "Payload file not found: $payloadPath"
+            exit 2
+          }
+          $payload = Get-Content -Raw -Path $payloadPath
+          Write-Output "Payload length: $($payload.Length) chars"
+
+          try {
+            Write-Output "Posting to $env:INGEST_URL"
+            $resp = Invoke-RestMethod -Uri $env:INGEST_URL -Method Post -Headers @{ 'X-Admin-Key' = $env:ADMIN_KEY; 'Content-Type' = 'application/json' } -Body $payload -ErrorAction Stop
+            Write-Output "HTTP request succeeded. Response (as JSON):"
+            $resp | ConvertTo-Json -Depth 10 | Write-Output
+            $resp | ConvertTo-Json -Depth 10 | Out-File -FilePath import-response.json -Encoding Utf8
+          } catch {
+            Write-Output "Invoke-RestMethod failed: $_"
+            $_ | Out-File -FilePath import-response.json -Encoding Utf8
+            exit 1
+          }
+
+      - name: Upload response
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-response
+          path: import-response.json

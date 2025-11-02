@@ -1,0 +1,77 @@
+[
+  {
+    "event": "comment.created",
+    "data": {
+      "source": "yclients",
+      "source_id": 39739599,
+      "text": "Это было очень круто.",
+      "rating": 5,
+      "author_name": "Владислав",
+      "author_phone": "+7 913 900-06-05",
+      "author_email": "",
+      "master_id": 3269178,
+      "record_id": 1375005072,
+      "created_at": "2025-11-02 23:15:44"
+    }
+  },
+  {
+    "event": "comment.created",
+    "data": {
+      "source": "yclients",
+      "source_id": 39619434,
+      "text": "Очень, вежливый, весёлый, позитивный парень, всё супер!",
+      "rating": 5,
+      "author_name": "Тахмина",
+      "author_phone": "+7 962 962-75-84",
+      "author_email": "",
+      "master_id": 2748512,
+      "record_id": 1379422002,
+      "created_at": "2025-10-31 23:07:02"
+    }
+  },
+  {
+    "event": "comment.created",
+    "data": {
+      "source": "yclients",
+      "source_id": 39267228,
+      "text": "Очень понравился каппинг, впервые была. Приду ещё!",
+      "rating": 5,
+      "author_name": "Ольга",
+      "author_phone": "+7 905 541-90-02",
+      "author_email": "olganpaw@yandex.ru",
+      "master_id": 2748512,
+      "record_id": 1309258899,
+      "created_at": "2025-10-26 13:59:16"
+    }
+  },
+  {
+    "event": "comment.created",
+    "data": {
+      "source": "yclients",
+      "source_id": 39235239,
+      "text": "В целом каппинг был хорошим, очень интересно. Единственное, вела его, по сути, представительница бренда, а не Денис, не очень понятно, зачем тогда нужны были тренера. И по времени заявлено было 3 часа, а в итоге полтора. В остальном всё отлично подготовили, очень интересно было попробовать, спасибо",
+      "rating": 4,
+      "author_name": "Лида",
+      "author_phone": "+7 902 583-10-72",
+      "author_email": "duhvremene@mail.ru",
+      "master_id": 2748512,
+      "record_id": 1290012411,
+      "created_at": "2025-10-25 21:04:59"
+    }
+  },
+  {
+    "event": "comment.created",
+    "data": {
+      "source": "yclients",
+      "source_id": 39074835,
+      "text": "Очень понравился курс. Было интересно, Сабрина прекрасный тренер, показала и рассказала нам все очень понятно, поддерживала и помогала. Желаю вашей школе процветания и ценить таких талантливых сотрудников.:)",
+      "rating": 5,
+      "author_name": "Полина",
+      "author_phone": "+7 926 365-85-79",
+      "author_email": "",
+      "master_id": 3915755,
+      "record_id": 1256552067,
+      "created_at": "2025-10-23 16:13:54"
+    }
+  }
+]
