@@ -244,18 +244,19 @@ function Process-And-MapItems {
     $userName = $null
     if ($c.user_name) { $userName = $c.user_name } elseif ($c.user_name_raw) { $userName = $c.user_name_raw } elseif ($c.user) { $userName = $c.user.name } else { $userName = $c.user_name }
 
-    # master association present?
-    $hasMaster = ($null -ne $c.master_id) -and ([int]$c.master_id -ne 0)
+  # master association present? (kept for metadata but NOT required in relaxed mode)
+  $hasMaster = ($null -ne $c.master_id) -and ([int]$c.master_id -ne 0)
 
     # Exclude master-authored comments when requested (type==1 are master comments)
     if ($ExcludeMasterComments -and ($null -ne $c.type) -and ([int]$c.type -eq 1)) { continue }
 
-    # OnlyReviews mode: require rating in 1..5, non-empty text (>= TextMinLength), a username and a master association
+    # OnlyReviews mode: require rating in 1..5 and non-empty text (>= TextMinLength) and a username
+    # NOTE: relaxed: DO NOT require master association to allow reviews without master_id to pass
     if ($OnlyReviews) {
       $okRating = ($null -ne $ratingVal -and $ratingVal -ge 1 -and $ratingVal -le 5)
       $okText = ($TextMinLength -le 0) -or ($t -and ($t.Length -ge $TextMinLength))
       $okUser = ($userName -and ($userName.ToString().Trim().Length -gt 0))
-      if (-not ($okRating -and $okText -and $okUser -and $hasMaster)) {
+      if (-not ($okRating -and $okText -and $okUser)) {
         continue
       }
     }
