@@ -278,6 +278,17 @@ if ($existingIds.Count -gt 0) {
   $toImport = $allEvents
 }
 
+# When running as DryRun, show a representative sample of mapped payloads
+if ($DryRun) {
+  $total = $toImport.Count
+  Write-Output "DryRun: total mapped events to import (after filtering): $total"
+  if ($total -gt 0) {
+    $sample = $toImport | Select-Object -First 10
+    Write-Output "DryRun: showing first $($sample.Count) mapped payloads (ConvertTo-Json depth=6):"
+    foreach ($s in $sample) { Write-Output ($s | ConvertTo-Json -Depth 6) }
+  }
+}
+
 # send in batches
 $batches = [System.Collections.ArrayList]::new()
 for ($i=0; $i -lt $toImport.Count; $i += $BatchSize) {

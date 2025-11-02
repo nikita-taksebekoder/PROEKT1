@@ -19,9 +19,9 @@ jobs:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
         run: |
-          Write-Output 'Running backfill.ps1 safe test: page=1 batch=1'
+          Write-Output 'Running backfill.ps1 safe test (invoking pwsh -File)'
           if (Test-Path ./backfill.ps1) {
-            ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 100 -BatchSize 100 -MaxPages 20 -OnlyReviews:$false -DryRun
+            pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 100 -BatchSize 100 -MaxPages 20 -OnlyReviews:$false -DryRun
           } else {
             Write-Error 'backfill.ps1 not found in repo'
             exit 1
