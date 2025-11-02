@@ -1,0 +1,25 @@
+name: raw-dump-long
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  raw-dump:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run extended raw-dump (MaxPages=500)
+        env:
+          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
+          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
+        run: |
+          Write-Output 'Running extended raw-dump (MaxPages=500 PageSize=100 PrintBodyOnError)'
+          if (Test-Path ./scripts/raw-dump.ps1) {
+            & ./scripts/raw-dump.ps1 -CompanyId $env:YCLIENTS_COMPANY_ID -PageSize 100 -MaxPages 500 -MaxOutput 200 -PrintBodyOnError -VerboseAuth
+          } else {
+            Write-Error 'scripts/raw-dump.ps1 not found'
+            exit 1
+          }
