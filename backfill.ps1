@@ -35,6 +35,8 @@ param(
   [string]$CompanyId = $env:YCLIENTS_COMPANY_ID,
   [int]$PageSize = 100,
   [int]$BatchSize = 5,
+  [int]$MaxPages = 0,
+  [bool]$OnlyReviews = $true,
   [switch]$SyncDeleteMissing,
   [switch]$VerboseAuthTests,
   [switch]$InsecureSkipSsl
@@ -179,6 +181,7 @@ if ($AdminKey) {
 }
 
 $allEvents = @()
+$scannedItems = 0
 $page = 1
 while ($true) {
   $target = "https://api.yclients.com/api/v1/comments/$CompanyId/" + "?page=$page&count=$PageSize"
@@ -189,7 +192,23 @@ while ($true) {
   $items = @()
   if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } elseif ($resp.comments) { $items = $resp.comments } else { $items = @($resp) }
   if ($items.Count -eq 0) { break }
-  foreach ($c in $items) {
+  $scannedItems += $items.Count
+
+  # Filter items to only reviews when requested. YCLIENTS review items typically have type==1
+  # or include a 'rating' field or non-empty text. This avoids importing non-review comments.
+  if ($OnlyReviews) {
+    $filtered = $items | Where-Object {
+      ($_.type -eq 1) -or ($_.rating -ne $null) -or ($_.text -and $_.text.ToString().Trim().Length -gt 0)
+    }
+  } else {
+    $filtered = $items
+  }
+
+  if ($filtered.Count -eq 0) {
+    Write-Output "No review-like items on page $page (scanned $($scannedItems) items so far)."
+  }
+
+  foreach ($c in $filtered) {
     # map to worker's expected payload — adjust mapping if necessary
     $evt = [PSCustomObject]@{
       event = 'comment.created'
@@ -203,9 +222,10 @@ while ($true) {
     }
     $allEvents += $evt
   }
-  Write-Output "Collected $($allEvents.Count) total events so far"
+  Write-Output "Collected $($allEvents.Count) total events so far (scanned $scannedItems items)"
   # pagination stop condition — try to detect based on response size
   if ($items.Count -lt $PageSize) { break }
+  if ($MaxPages -gt 0 -and $page -ge $MaxPages) { Write-Output "Reached MaxPages=$MaxPages; stopping."; break }
   $page++
 }
 
