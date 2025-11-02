@@ -21,7 +21,7 @@ jobs:
         run: |
           Write-Output 'Running backfill.ps1 safe test: page=1 batch=1'
           if (Test-Path ./backfill.ps1) {
-            ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 100 -BatchSize 100 -MaxPages 50 -DryRun
+            ./backfill.ps1 -IngestUrl "$env:INGEST_URL" -AdminKey "$env:ADMIN_KEY" -PartnerToken "$env:YCLIENTS_PARTNER_TOKEN" -UserToken "$env:YCLIENTS_USER_TOKEN" -CompanyId "$env:YCLIENTS_COMPANY_ID" -PageSize 100 -BatchSize 100 -MaxPages 50 -ServerSideRating -DryRun
           } else {
             Write-Error 'backfill.ps1 not found in repo'
             exit 1

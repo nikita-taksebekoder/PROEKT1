@@ -37,6 +37,7 @@ param(
   [int]$BatchSize = 5,
   [int]$MaxPages = 0,
   [bool]$OnlyReviews = $true,
+  [switch]$ServerSideRating,
   [switch]$DryRun,
   [switch]$SyncDeleteMissing,
   [switch]$VerboseAuthTests,
@@ -183,59 +184,88 @@ if ($AdminKey) {
 
 $allEvents = @()
 $scannedItems = 0
-$page = 1
-while ($true) {
-  $target = "https://api.yclients.com/api/v1/comments/$CompanyId/" + "?page=$page&count=$PageSize"
-  Write-Output "Fetching page $page..."
-  $resp = Invoke-YClientsGet -url $target
-  if (-not $resp) { break }
-  # YCLIENTS returns array or object depending on API; try to find items
-  $items = @()
-  if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } elseif ($resp.comments) { $items = $resp.comments } else { $items = @($resp) }
-  if ($items.Count -eq 0) { break }
-  $scannedItems += $items.Count
+function Process-And-MapItems {
+  param($items)
+  foreach ($c in $items) {
+    # determine whether this item qualifies as a review (server-side may already ensure rating)
+    $hasRating = ($c.rating -ne $null) -and ([int]($c.rating) -gt 0)
+    $hasRecord = ($c.record_id -ne $null) -and ([int]($c.record_id) -ne 0)
+    if ($OnlyReviews -and -not ($hasRating -or $hasRecord)) { continue }
 
-  # Filter items to only true reviews when requested.
-  # Practical definition of a 'review' here:
-  # - has a numeric rating (rating != null and > 0) OR
-  # - was left tied to a record/visit (record_id != 0)
-  # This excludes free-form text comments without rating, which are not reviews.
-  # Note: YCLIENTS supports a query param 'rating' on GET /comments to filter by rating, but
-  # to get all rated comments we filter client-side using the presence/value of 'rating' or 'record_id'.
-  if ($OnlyReviews) {
-    $filtered = $items | Where-Object {
-      $hasRating = ($_.rating -ne $null) -and ([int]($_.rating) -gt 0)
-      $hasRecord = ($_.record_id -ne $null) -and ([int]($_.record_id) -ne 0)
-      return ($hasRating -or $hasRecord)
+    # map fields required by Tilda: id, rating, text, user_name (and parsed first/last), master_id, record_id, date
+    $userName = $null
+    if ($c.user_name) { $userName = $c.user_name } elseif ($c.user_name_raw) { $userName = $c.user_name_raw } elseif ($c.user) { $userName = $c.user.name } else { $userName = $c.user_name }
+    $first = $null; $last = $null
+    if ($userName) {
+      $parts = $userName -split '\s+' | Where-Object { $_ -ne '' }
+      if ($parts.Count -ge 2) { $first = $parts[0]; $last = ($parts[1..($parts.Count-1)] -join ' ') } else { $first = $userName }
     }
-    Write-Output "Filtered to $($filtered.Count) review items from $($items.Count) items on this page"
-  } else {
-    $filtered = $items
-  }
 
-  if ($filtered.Count -eq 0) {
-    Write-Output "No review-like items on page $page (scanned $($scannedItems) items so far)."
-  }
-
-  foreach ($c in $filtered) {
-    # map to worker's expected payload — adjust mapping if necessary
     $evt = [PSCustomObject]@{
       event = 'comment.created'
       data = [PSCustomObject]@{
         id = ($c.id -as [string])
+        salon_id = ($c.salon_id -as [string])
+        master_id = ($c.master_id -as [string])
+        type = $c.type
+        record_id = ($c.record_id -as [string])
+        rating = (if ($c.rating -ne $null) { [int]$c.rating } else { $null })
         text = $c.text
         date = $c.date
-        author = $c.author
-        raw = $c
+        user_id = ($c.user_id -as [string])
+        user_name = $userName
+        user_first = $first
+        user_last = $last
+        user_avatar = $c.user_avatar
       }
     }
+
+    # Do not include raw object in production payloads; keep it for DryRun inspection only
+    if ($DryRun) { $evt.data.raw = $c }
+
     $allEvents += $evt
   }
-  Write-Output "Collected $($allEvents.Count) total events so far (scanned $scannedItems items)"
-  # pagination stop condition — try to detect based on response size
-  if ($items.Count -lt $PageSize) { break }
-  if ($MaxPages -gt 0 -and $page -ge $MaxPages) { Write-Output "Reached MaxPages=$MaxPages; stopping."; break }
-  $page++
+}
+
+# Two fetch modes: server-side rating filtering (faster, less noise) or client-side full walk
+$rateValues = 5..1
+if ($ServerSideRating) {
+  Write-Output "ServerSideRating enabled: fetching rated comments by rating=5..1"
+  foreach ($rating in $rateValues) {
+    $page = 1
+    while ($true) {
+      $target = "https://api.yclients.com/api/v1/comments/$CompanyId/?page=$page&count=$PageSize&rating=$rating"
+      Write-Output "Fetching rating=$rating page $page..."
+      $resp = Invoke-YClientsGet -url $target
+      if (-not $resp) { break }
+      $items = @()
+      if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } elseif ($resp.comments) { $items = $resp.comments } else { $items = @($resp) }
+      if ($items.Count -eq 0) { break }
+      $scannedItems += $items.Count
+      Process-And-MapItems -items $items
+      Write-Output "Collected $($allEvents.Count) total events so far (scanned $scannedItems items)"
+      if ($items.Count -lt $PageSize) { break }
+      if ($MaxPages -gt 0 -and $page -ge $MaxPages) { Write-Output "Reached MaxPages=$MaxPages for rating=$rating; stopping."; break }
+      $page++
+    }
+  }
+} else {
+  $page = 1
+  while ($true) {
+    $target = "https://api.yclients.com/api/v1/comments/$CompanyId/?page=$page&count=$PageSize"
+    Write-Output "Fetching page $page..."
+    $resp = Invoke-YClientsGet -url $target
+    if (-not $resp) { break }
+    $items = @()
+    if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } elseif ($resp.comments) { $items = $resp.comments } else { $items = @($resp) }
+    if ($items.Count -eq 0) { break }
+    $scannedItems += $items.Count
+    Process-And-MapItems -items $items
+    Write-Output "Collected $($allEvents.Count) total events so far (scanned $scannedItems items)"
+    if ($items.Count -lt $PageSize) { break }
+    if ($MaxPages -gt 0 -and $page -ge $MaxPages) { Write-Output "Reached MaxPages=$MaxPages; stopping."; break }
+    $page++
+  }
 }
 
 if ($allEvents.Count -eq 0) { Write-Output 'No events found; exiting'; exit 0 }
