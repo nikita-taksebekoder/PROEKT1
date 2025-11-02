@@ -1,0 +1,64 @@
+name: Backfill DryRun (no prefetch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      MaxPages:
+        description: 'Max pages to scan'
+        required: false
+        default: '3'
+      BatchSize:
+        description: 'How many items per import batch (unused in DryRun)'
+        required: false
+        default: '5'
+      PageSize:
+        description: 'YCLIENTS page size (count param)'
+        required: false
+        default: '100'
+      TextMinLength:
+        description: 'Minimum text length to accept (overrides default)'
+        required: false
+        default: '1'
+
+jobs:
+  dryrun-no-prefetch:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run backfill script (DryRun, no AdminKey)
+        shell: pwsh
+        env:
+          YCLIENTS_PARTNER_TOKEN: ${{ secrets.YCLIENTS_PARTNER_TOKEN }}
+          YCLIENTS_USER_TOKEN: ${{ secrets.YCLIENTS_USER_TOKEN }}
+          YCLIENTS_COMPANY_ID: ${{ secrets.YCLIENTS_COMPANY_ID }}
+        run: |
+          $args = @(
+            '-IngestUrl', '${{ secrets.INGEST_URL }}',
+            '-PartnerToken', '${{ secrets.YCLIENTS_PARTNER_TOKEN }}',
+            '-UserToken', '${{ secrets.YCLIENTS_USER_TOKEN }}',
+            '-CompanyId', '${{ secrets.YCLIENTS_COMPANY_ID }}',
+            '-MaxPages', '${{ github.event.inputs.MaxPages }}',
+            '-BatchSize', '${{ github.event.inputs.BatchSize }}',
+            '-PageSize', '${{ github.event.inputs.PageSize }}',
+            '-TextMinLength', '${{ github.event.inputs.TextMinLength }}',
+            '-DryRun'
+          )
+          Write-Output "Invoking backfill.ps1 (DryRun, no AdminKey) with args: $($args -join ' ')"
+          pwsh -NoProfile -File .\backfill.ps1 @args 2>&1 | Tee-Object run.log
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-dryrun-no-prefetch-output
+          path: run.log
+
+      - name: Show sample
+        if: always()
+        shell: pwsh
+        run: Get-Content run.log -TotalCount 200
+
+# Notes: This workflow intentionally does not pass AdminKey to avoid filtering by
+# existing ids; it's safe because DryRun is enabled and only prints mapped payloads.
