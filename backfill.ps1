@@ -37,6 +37,7 @@ param(
   [int]$BatchSize = 5,
   [int]$MaxPages = 0,
   [bool]$OnlyReviews = $true,
+  [switch]$DryRun,
   [switch]$SyncDeleteMissing,
   [switch]$VerboseAuthTests,
   [switch]$InsecureSkipSsl
@@ -260,18 +261,24 @@ $batchIndex = 0
 foreach ($batch in $batches) {
   $batchIndex++
   Write-Output "Importing batch $batchIndex of $($batches.Count) — $($batch.Count) items"
-  if ($AdminKey) {
-  $resp = Invoke-AdminImport -payload $batch
+  if ($DryRun) {
+    Write-Output "DryRun: would POST batch $batchIndex with $($batch.Count) items to /admin/import (skipping actual POST)"
+    # show first few payload examples when dry-running
+    $examples = $batch | Select-Object -First 3
+    Write-Output "DryRun examples (first 3 items):"
+    foreach ($e in $examples) { Write-Output ($e | ConvertTo-Json -Depth 6) }
+  } elseif ($AdminKey) {
+    $resp = Invoke-AdminImport -payload $batch
     if ($resp -and $resp.results) {
-    foreach ($r in $resp.results) {
-      if ($r.ok -eq $true -and $r.id) { $importedIds += $r.id }
-    }
-  Write-Output "Batch result: imported $($resp.imported)"
+      foreach ($r in $resp.results) {
+        if ($r.ok -eq $true -and $r.id) { $importedIds += $r.id }
+      }
+      Write-Output "Batch result: imported $($resp.imported)"
     } else {
-  Write-Output "Batch import returned no result or failed"
+      Write-Output "Batch import returned no result or failed"
     }
   } else {
-  Write-Output "AdminKey not provided; skipping POST to /admin/import (diagnostic mode)"
+    Write-Output "AdminKey not provided; skipping POST to /admin/import (diagnostic mode)"
   }
 }
 
