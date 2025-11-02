@@ -39,6 +39,10 @@ param(
   [bool]$OnlyReviews = $true,
   [switch]$ServerSideRating,
   [switch]$DryRun,
+  # Minimum text length to consider a comment a real review. Set to 0 to disable.
+  [int]$TextMinLength = 20,
+  # Exclude comments authored by masters (type == 1). Set to $false to include.
+  [switch]$ExcludeMasterComments,
   [switch]$SyncDeleteMissing,
   [switch]$VerboseAuthTests,
   [switch]$InsecureSkipSsl
@@ -191,6 +195,16 @@ function Process-And-MapItems {
     $hasRating = ($null -ne $c.rating) -and ([int]$c.rating -gt 0)
     $hasRecord = ($null -ne $c.record_id) -and ([int]$c.record_id -ne 0)
     if ($OnlyReviews -and -not ($hasRating -or $hasRecord)) { continue }
+
+    # Exclude master-authored comments when requested (type==1 are master comments)
+    if ($ExcludeMasterComments -and ($null -ne $c.type) -and ([int]$c.type -eq 1)) { continue }
+
+    # Enforce minimum text length when requested (helps drop '+' and very short notes)
+    if ($TextMinLength -gt 0) {
+      $t = $null
+      if ($c.text) { $t = $c.text.ToString().Trim() }
+      if (-not $t -or ($t.Length -lt $TextMinLength)) { continue }
+    }
 
     # map fields required by Tilda: id, rating, text, user_name (and parsed first/last), master_id, record_id, date
     $userName = $null
