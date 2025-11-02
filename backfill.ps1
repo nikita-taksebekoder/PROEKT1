@@ -194,12 +194,20 @@ while ($true) {
   if ($items.Count -eq 0) { break }
   $scannedItems += $items.Count
 
-  # Filter items to only reviews when requested. YCLIENTS review items typically have type==1
-  # or include a 'rating' field or non-empty text. This avoids importing non-review comments.
+  # Filter items to only true reviews when requested.
+  # Practical definition of a 'review' here:
+  # - has a numeric rating (rating != null and > 0) OR
+  # - was left tied to a record/visit (record_id != 0)
+  # This excludes free-form text comments without rating, which are not reviews.
+  # Note: YCLIENTS supports a query param 'rating' on GET /comments to filter by rating, but
+  # to get all rated comments we filter client-side using the presence/value of 'rating' or 'record_id'.
   if ($OnlyReviews) {
     $filtered = $items | Where-Object {
-      ($_.type -eq 1) -or ($_.rating -ne $null) -or ($_.text -and $_.text.ToString().Trim().Length -gt 0)
+      $hasRating = ($_.rating -ne $null) -and ([int]($_.rating) -gt 0)
+      $hasRecord = ($_.record_id -ne $null) -and ([int]($_.record_id) -ne 0)
+      return ($hasRating -or $hasRecord)
     }
+    Write-Output "Filtered to $($filtered.Count) review items from $($items.Count) items on this page"
   } else {
     $filtered = $items
   }
