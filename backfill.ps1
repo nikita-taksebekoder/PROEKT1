@@ -71,7 +71,7 @@ if (-not $CompanyId) { Write-Error 'CompanyId is required (param or env YCLIENTS
 function Invoke-YClientsGet {
   param($url)
   # Use HttpClient and send the documented Authorization header first: "Bearer <partner>, User <user>"
-  $accept = 'application/vnd.yclients.v2+json'
+  $accept = 'application/vnd.api.v2+json'
 
   # Prepare HttpClient with optional insecure SSL skip
   $handler = New-Object System.Net.Http.HttpClientHandler
@@ -113,13 +113,18 @@ function Invoke-YClientsGet {
       $null = $req.Headers.TryAddWithoutValidation($k, $v)
     }
 
-    try {
-      $resp = $client.SendAsync($req).Result
-      $code = [int]$resp.StatusCode
-      $body = $resp.Content.ReadAsStringAsync().Result
-      if ($code -ge 200 -and $code -lt 300) {
-        try { return ($body | ConvertFrom-Json) } catch { return $body }
-      } else {
+    $maxRetries = 5
+    $retry = 0
+    $backoff = 1
+    while ($true) {
+      try {
+        $resp = $client.SendAsync($req).Result
+        $code = [int]$resp.StatusCode
+        $body = $resp.Content.ReadAsStringAsync().Result
+        if ($code -ge 200 -and $code -lt 300) {
+          try { return ($body | ConvertFrom-Json) } catch { return $body }
+        }
+
         Write-Output "Attempt failed: HTTP $code - $body"
         $lastErr = "HTTP $code - $body"
         if ($VerboseAuthTests) {
@@ -128,28 +133,64 @@ function Invoke-YClientsGet {
           Write-Output "HTTP Status: $code"
           Write-Output "Response body:`n$body`n"
         }
+
+        # Rate limit handling (429) — prefer Retry-After header, else parse seconds from message
+        if ($code -eq 429) {
+          $retryAfter = $null
+          try { $retryAfter = [int]$resp.Headers.RetryAfter.Delta.TotalSeconds } catch {}
+          if (-not $retryAfter) {
+            if ($body -match '(\d+)') { $retryAfter = [int]$matches[1] } else { $retryAfter = 1 }
+          }
+          Write-Output "YCLIENTS rate limit hit — sleeping $($retryAfter + 1)s and retrying (attempt $retry)"
+          Start-Sleep -Seconds ($retryAfter + 1)
+          $retry++
+          if ($retry -gt $maxRetries) { break }
+          $backoff = [Math]::Min(60, $backoff * 2)
+          continue
+        }
+
+        # API asks for Accept header -> try next header attempt
+        if ($code -eq 400 -and $body -and $body -match 'Accept') {
+          Write-Output "YCLIENTS requires Accept header; skipping this header combo and trying next."
+          break
+        }
+
+        if ($code -ge 500 -and $retry -lt $maxRetries) {
+          Start-Sleep -Seconds $backoff
+          $retry++
+          $backoff = [Math]::Min(60, $backoff * 2)
+          continue
+        }
+
         if ($code -eq 401) {
           Write-Error "YCLIENTS returned 401 Unauthorized. Masked tokens: $display"
         }
-      }
-    } catch {
-      $ex = $_.Exception
-      $lastErr = $ex.Message
-      if ($VerboseAuthTests) {
-        Write-Output "--- Debug: Exception on attempt #$idx ---"
-        Write-Output "Request Headers: $display"
-        Write-Output "Exception: $($ex.ToString())"
-        try {
-          if ($ex.Response -and $ex.Response.Content) {
-            $respBody = $ex.Response.Content.ReadAsStringAsync().Result
-            Write-Output "Exception response body:`n$respBody`n"
+
+        break
+      } catch {
+        $ex = $_.Exception
+        $lastErr = $ex.Message
+        if ($VerboseAuthTests) {
+          Write-Output "--- Debug: Exception on attempt #$idx ---"
+          Write-Output "Request Headers: $display"
+          Write-Output "Exception: $($ex.ToString())"
+          try {
+            if ($ex.Response -and $ex.Response.Content) {
+              $respBody = $ex.Response.Content.ReadAsStringAsync().Result
+              Write-Output "Exception response body:`n$respBody`n"
+            }
+          } catch {
+            Write-Verbose ("Failed to read exception response body: {0}" -f $_.Exception.Message)
           }
-        } catch {
-          # Log failure to read exception response body for diagnostics
-          Write-Verbose ("Failed to read exception response body: {0}" -f $_.Exception.Message)
+        } else {
+          Write-Output "Attempt exception: $lastErr"
         }
-      } else {
-        Write-Output "Attempt exception: $lastErr"
+
+        $retry++
+        if ($retry -gt $maxRetries) { break }
+        Start-Sleep -Seconds $backoff
+        $backoff = [Math]::Min(60, $backoff * 2)
+        continue
       }
     }
   }

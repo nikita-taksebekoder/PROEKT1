@@ -22,12 +22,13 @@ function Send-Get {
   $handler = New-Object System.Net.Http.HttpClientHandler
   if ($InsecureSkipSsl) { $handler.ServerCertificateCustomValidationCallback = { return $true } }
   $client = New-Object System.Net.Http.HttpClient($handler)
+  $accept = 'application/vnd.api.v2+json'
 
   $attempts = @()
   if ($PartnerToken -and $UserToken) {
-    $attempts += @{ 'Authorization' = "Bearer $PartnerToken, User $UserToken"; 'label' = 'Bearer Partner+User' }
+    $attempts += @{ 'Authorization' = "Bearer $PartnerToken, User $UserToken"; 'label' = 'Bearer Partner+User'; 'Accept' = $accept }
   }
-  if ($PartnerToken) { $attempts += @{ 'Authorization' = "Bearer $PartnerToken" } }
+  if ($PartnerToken) { $attempts += @{ 'Authorization' = "Bearer $PartnerToken"; 'Accept' = $accept } }
   # ensure labels for attempts
   for ($i=0;$i -lt $attempts.Count;$i++) {
     if (-not $attempts[$i].ContainsKey('label')) { $attempts[$i]['label'] = "attempt-$($i+1)" }
@@ -40,22 +41,67 @@ function Send-Get {
       $null = $req.Headers.TryAddWithoutValidation($k, $hdr[$k])
     }
     if ($VerboseAuth) { Write-Output ("Trying auth header: {0}" -f $hdr['label']) }
-    try {
-      $resp = $client.SendAsync($req).Result
-      $code = [int]$resp.StatusCode
-      $body = $resp.Content.ReadAsStringAsync().Result
-      if ($code -ge 200 -and $code -lt 300) { 
-        try { return ($body | ConvertFrom-Json) } catch { return $body }
-      } else {
+
+    $maxRetries = 5
+    $retry = 0
+    $backoff = 1
+    while ($true) {
+      try {
+        $resp = $client.SendAsync($req).Result
+        $code = [int]$resp.StatusCode
+        $body = $resp.Content.ReadAsStringAsync().Result
+        if ($code -ge 200 -and $code -lt 300) {
+          try { return ($body | ConvertFrom-Json) } catch { return $body }
+        }
+
+        # Rate limit or soft-fail handling
+        if ($code -eq 429) {
+          # prefer Retry-After header
+          $retryAfter = $null
+          try { $retryAfter = [int]$resp.Headers.RetryAfter.Delta.TotalSeconds } catch {}
+          if (-not $retryAfter) {
+            # try to parse seconds from body
+            if ($body -match '(\d+)') { $retryAfter = [int]$matches[1] }
+            else { $retryAfter = 1 }
+          }
+          Write-Output "HTTP 429 received for $url — sleeping $($retryAfter + 1)s before retry"
+          Start-Sleep -Seconds ($retryAfter + 1)
+          $retry++; if ($retry -gt $maxRetries) { break }
+          $backoff = [Math]::Min(60, $backoff * 2)
+          continue
+        }
+
+        # Handle known API message requesting Accept header — forward as a diagnostic and continue to next header attempt
+        if ($code -eq 400 -and $body -and $body -match 'Accept') {
+          if ($PrintBodyOnError) { Write-Output $body }
+          Write-Output "HTTP 400 (Accept header) for $url — will try next auth/header form"
+          break
+        }
+
         if ($PrintBodyOnError) {
           Write-Output ("HTTP $code returned for $url (auth={0}) -- response body:" -f $hdr['label'])
           Write-Output $body
         } else {
           Write-Output "HTTP $code returned for $url"
         }
+
+        # For server errors, retry with backoff
+        if ($code -ge 500 -and $retry -lt $maxRetries) {
+          Start-Sleep -Seconds $backoff
+          $retry++
+          $backoff = [Math]::Min(60, $backoff * 2)
+          continue
+        }
+
+        break
+      } catch {
+        Write-Output "Request exception: $($_.Exception.Message)"
+        $retry++
+        if ($retry -gt $maxRetries) { break }
+        Start-Sleep -Seconds $backoff
+        $backoff = [Math]::Min(60, $backoff * 2)
+        continue
       }
-    } catch {
-      Write-Output "Request exception: $($_.Exception.Message)"
     }
   }
   return $null
