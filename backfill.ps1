@@ -231,7 +231,15 @@ function Process-And-MapItems {
       data = [PSCustomObject]$data
     }
 
-    $allEvents += $evt
+    if ($allEvents -is [System.Collections.ArrayList]) {
+      $null = $allEvents.Add($evt)
+    } else {
+      # fallback: ensure we have an ArrayList to collect events reliably
+      $tmp = [System.Collections.ArrayList]::new()
+      if ($allEvents) { $tmp.AddRange(@($allEvents)) | Out-Null }
+      $null = $tmp.Add($evt)
+      $allEvents = $tmp
+    }
   }
 }
 
