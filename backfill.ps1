@@ -40,7 +40,7 @@ param(
   [switch]$ServerSideRating,
   [switch]$DryRun,
   # Minimum text length to consider a comment a real review. Set to 0 to disable.
-  [int]$TextMinLength = 20,
+  [int]$TextMinLength = 3,
   # Exclude comments authored by masters (type == 1). Set to $false to include.
   [switch]$ExcludeMasterComments,
   [switch]$SyncDeleteMissing,
@@ -232,34 +232,32 @@ $scannedItems = 0
 function Process-And-MapItems {
   param($items)
   foreach ($c in $items) {
-    # determine whether this item qualifies as a review (server-side may already ensure rating)
-    $hasRating = ($null -ne $c.rating) -and ([int]$c.rating -gt 0)
-    $hasRecord = ($null -ne $c.record_id) -and ([int]$c.record_id -ne 0)
-    if ($OnlyReviews -and -not ($hasRating -or $hasRecord)) { continue }
-
-    # Exclude master-authored comments when requested (type==1 are master comments)
-    if ($ExcludeMasterComments -and ($null -ne $c.type) -and ([int]$c.type -eq 1)) { continue }
-
-    # Enforce minimum text length when requested (helps drop '+' and very short notes)
-    if ($TextMinLength -gt 0) {
-      $t = $null
-      if ($c.text) { $t = $c.text.ToString().Trim() }
-      if (-not $t -or ($t.Length -lt $TextMinLength)) { continue }
-    }
-
-    # map fields required by Tilda: id, rating, text, user_name (and parsed first/last), master_id, record_id, date
-    $userName = $null
-    if ($c.user_name) { $userName = $c.user_name } elseif ($c.user_name_raw) { $userName = $c.user_name_raw } elseif ($c.user) { $userName = $c.user.name } else { $userName = $c.user_name }
-    $first = $null; $last = $null
-    if ($userName) {
-      $parts = $userName -split '\s+' | Where-Object { $_ -ne '' }
-      if ($parts.Count -ge 2) { $first = $parts[0]; $last = ($parts[1..($parts.Count-1)] -join ' ') } else { $first = $userName }
-    }
-
     # compute rating value safely
     $ratingVal = $null
     if ($null -ne $c.rating) {
       try { $ratingVal = [int]$c.rating } catch { $ratingVal = $null }
+    }
+
+    # normalize text and username early
+    $t = $null
+    if ($c.text) { $t = $c.text.ToString().Trim() }
+    $userName = $null
+    if ($c.user_name) { $userName = $c.user_name } elseif ($c.user_name_raw) { $userName = $c.user_name_raw } elseif ($c.user) { $userName = $c.user.name } else { $userName = $c.user_name }
+
+    # master association present?
+    $hasMaster = ($null -ne $c.master_id) -and ([int]$c.master_id -ne 0)
+
+    # Exclude master-authored comments when requested (type==1 are master comments)
+    if ($ExcludeMasterComments -and ($null -ne $c.type) -and ([int]$c.type -eq 1)) { continue }
+
+    # OnlyReviews mode: require rating in 1..5, non-empty text (>= TextMinLength), a username and a master association
+    if ($OnlyReviews) {
+      $okRating = ($null -ne $ratingVal -and $ratingVal -ge 1 -and $ratingVal -le 5)
+      $okText = ($TextMinLength -le 0) -or ($t -and ($t.Length -ge $TextMinLength))
+      $okUser = ($userName -and ($userName.ToString().Trim().Length -gt 0))
+      if (-not ($okRating -and $okText -and $okUser -and $hasMaster)) {
+        continue
+      }
     }
 
     # build data hashtable first so we can optionally include raw for DryRun
