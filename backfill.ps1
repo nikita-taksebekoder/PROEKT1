@@ -188,8 +188,8 @@ function Process-And-MapItems {
   param($items)
   foreach ($c in $items) {
     # determine whether this item qualifies as a review (server-side may already ensure rating)
-    $hasRating = ($c.rating -ne $null) -and ([int]($c.rating) -gt 0)
-    $hasRecord = ($c.record_id -ne $null) -and ([int]($c.record_id) -ne 0)
+    $hasRating = ($null -ne $c.rating) -and ([int]$c.rating -gt 0)
+    $hasRecord = ($null -ne $c.record_id) -and ([int]$c.record_id -ne 0)
     if ($OnlyReviews -and -not ($hasRating -or $hasRecord)) { continue }
 
     # map fields required by Tilda: id, rating, text, user_name (and parsed first/last), master_id, record_id, date
@@ -201,27 +201,35 @@ function Process-And-MapItems {
       if ($parts.Count -ge 2) { $first = $parts[0]; $last = ($parts[1..($parts.Count-1)] -join ' ') } else { $first = $userName }
     }
 
-    $evt = [PSCustomObject]@{
-      event = 'comment.created'
-      data = [PSCustomObject]@{
-        id = ($c.id -as [string])
-        salon_id = ($c.salon_id -as [string])
-        master_id = ($c.master_id -as [string])
-        type = $c.type
-        record_id = ($c.record_id -as [string])
-        rating = (if ($c.rating -ne $null) { [int]$c.rating } else { $null })
-        text = $c.text
-        date = $c.date
-        user_id = ($c.user_id -as [string])
-        user_name = $userName
-        user_first = $first
-        user_last = $last
-        user_avatar = $c.user_avatar
-      }
+    # compute rating value safely
+    $ratingVal = $null
+    if ($null -ne $c.rating) {
+      try { $ratingVal = [int]$c.rating } catch { $ratingVal = $null }
     }
 
-    # Do not include raw object in production payloads; keep it for DryRun inspection only
-    if ($DryRun) { $evt.data.raw = $c }
+    # build data hashtable first so we can optionally include raw for DryRun
+    $data = @{
+      id = ($c.id -as [string])
+      salon_id = ($c.salon_id -as [string])
+      master_id = ($c.master_id -as [string])
+      type = $c.type
+      record_id = ($c.record_id -as [string])
+      rating = $ratingVal
+      text = $c.text
+      date = $c.date
+      user_id = ($c.user_id -as [string])
+      user_name = $userName
+      user_first = $first
+      user_last = $last
+      user_avatar = $c.user_avatar
+    }
+
+    if ($DryRun) { $data['raw'] = $c }
+
+    $evt = [PSCustomObject]@{
+      event = 'comment.created'
+      data = [PSCustomObject]$data
+    }
 
     $allEvents += $evt
   }
