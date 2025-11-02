@@ -182,7 +182,7 @@ if ($AdminKey) {
   }
 }
 
-$allEvents = @()
+$allEvents = [System.Collections.ArrayList]::new()
 $scannedItems = 0
 function Process-And-MapItems {
   param($items)
