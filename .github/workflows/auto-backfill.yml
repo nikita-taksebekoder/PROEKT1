@@ -53,3 +53,22 @@ jobs:
           } catch {
             Write-Output "Enrich ping skipped or failed: $($_.Exception.Message)"
           }
+
+      - name: Refresh trainers list
+        shell: pwsh
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: |
+          if (-not $env:WORKER_URL) {
+            Write-Output "Missing WORKER_URL in secrets. Skipping trainers refresh."
+            exit 0
+          }
+          $url = "$env:WORKER_URL/trainers?refresh=1&company_id=453962"
+          Write-Output "Refreshing trainers list: $url"
+          try {
+            $resp = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 120
+            Write-Output "Trainers refreshed; returned count: $($resp.trainers.Count)"
+          } catch {
+            Write-Error "Trainers refresh failed: $($_.Exception.Message)"
+            # do not fail the whole workflow for a trainers refresh error; continue
+          }
