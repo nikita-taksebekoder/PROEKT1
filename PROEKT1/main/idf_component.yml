@@ -1,5 +1,0 @@
-# main/idf_component.yml — пример корректного содержимого БЕЗ esp_littlefs
-version: "0.1.0"
-dependencies:
-  idf: ">=5.3.0"
-  espressif/led_strip: "^2.5.0"
