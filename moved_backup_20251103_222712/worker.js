@@ -427,10 +427,21 @@ async function handleListEvents(request, env) {
   }
 
   // Fallback: list keys from KV (may be unordered)
+  // Use a paginated list to collect all keys (or up to available pages)
+  // so that recently-written keys are not missed when the total number
+  // of keys exceeds a single page.
   if (keys.length === 0 && env.WEBHOOK_KV && typeof env.WEBHOOK_KV.list === 'function') {
     try {
-      const listRes = await env.WEBHOOK_KV.list({ limit: 1000 });
-      keys = listRes.keys.map(k => k.name || k).filter(k => k !== 'events:version');
+      const allKeys = [];
+      let cursor = undefined;
+      while (true) {
+        const res = await env.WEBHOOK_KV.list({ limit: 1000, cursor });
+        const names = (res.keys || []).map(k => k.name || k).filter(n => n && n !== 'events:version');
+        allKeys.push(...names);
+        if (!res.cursor) break;
+        cursor = res.cursor;
+      }
+      keys = allKeys;
     } catch (e) {
       console.warn('KV list failed', e);
     }
@@ -550,13 +561,22 @@ function compactEvent(parsed) {
   try {
     const ev = parsed || {};
     const data = ev.data || {};
+    // include a few frequently-needed fields so the frontend (Tilda widget)
+    // can render reviews without reading the full body. Keep backward
+    // compatible names and fallbacks for common YCLIENTS shapes.
     return {
       event: ev.event || null,
       text: data.text || data.message || null,
       date: data.date || data.created_at || null,
-      id: data.id || null
+      id: data.id || null,
+      rating: (typeof data.rating !== 'undefined') ? data.rating : (data.rate || null),
+      author_name: data.author_name || data.user_name || data.client_name || null,
+      author_surname: data.author_surname || data.user_surname || null,
+      master_id: (typeof data.master_id !== 'undefined') ? data.master_id : (data.staff_id || null),
+      master_name: data.master_name || data.master || null
     };
   } catch (e) {
     return null;
   }
 }
+

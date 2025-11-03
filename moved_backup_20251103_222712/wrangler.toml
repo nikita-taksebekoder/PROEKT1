@@ -1,0 +1,19 @@
+name = "proxy-worker"
+main = "proxy-worker.js"
+compatibility_date = "2024-01-01"
+
+# Bindings
+kv_namespaces = [
+  { binding = "WEBHOOK_KV", id = "2d17bc191bfd41998759f2786e3dd6c3", preview_id = "2d17bc191bfd41998759f2786e3dd6c3" }
+]
+
+# Durable Objects
+[[durable_objects.bindings]]
+name = "WEBHOOK_DO"
+class_name = "WebhookQueue"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebhookQueue"]
+
+# If you have multiple workers, you can create separate wrangler.toml files or use --name flag

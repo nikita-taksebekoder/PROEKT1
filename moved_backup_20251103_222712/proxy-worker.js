@@ -484,10 +484,13 @@ async function handleAdminBackfill(request, env) {
   const companyId = env.YCLIENTS_COMPANY_ID || '453962';
   if (!partner || !companyId) return new Response(JSON.stringify({ error: 'YCLIENTS tokens missing' }), { status: 500, headers: jsonHeaders(env, request) });
 
-  const perPage = 100;
+  const perPage = Number(request.headers.get('X-Per-Page') || request.headers.get('x-per-page') || 100);
   let page = 1;
   let totalImported = 0;
   let errors = 0;
+  const errorDetails = [];
+  let quotaExceeded = false;
+  const force = (String(request.headers.get('X-Admin-Force') || request.headers.get('x-admin-force') || request.headers.get('force') || '').toLowerCase() === 'true') || (new URL(request.url).searchParams.get('force') === '1');
   try {
     while (true) {
       const target = new URL(`${YCLIENTS_API_BASE}/api/v1/comments/${encodeURIComponent(companyId)}/`);
@@ -506,6 +509,8 @@ async function handleAdminBackfill(request, env) {
 
       if (!yResp.ok) {
         const txt = await yResp.text().catch(()=>'');
+        // log upstream error for tail debugging
+        try { console.error('backfill upstream_error', { status: yResp.status, detail: txt, page, perPage }); } catch(_){}
         return new Response(JSON.stringify({ error: 'upstream_error', status: yResp.status, detail: txt }), { status: 502, headers: jsonHeaders(env, request) });
       }
       const txt = await yResp.text();
@@ -524,11 +529,46 @@ async function handleAdminBackfill(request, env) {
           if (!id) continue;
           const key = `yclients:${String(id)}`;
           const body = JSON.stringify({ event: 'api.comments', data: d });
-          await env.WEBHOOK_KV.put(key, body);
-          totalImported++;
-        } catch (e) { console.warn('put failed', e); errors++; }
+          if (!env.WEBHOOK_KV || typeof env.WEBHOOK_KV.put !== 'function') throw new Error('WEBHOOK_KV not available');
+          if (force) {
+            // force overwrite
+            await env.WEBHOOK_KV.put(key, body);
+            totalImported++;
+          } else {
+            // attempt to write; if key exists skip (idempotent)
+            try {
+              const existing = await env.WEBHOOK_KV.get(key);
+              if (existing) {
+                // skip duplicate
+              } else {
+                await env.WEBHOOK_KV.put(key, body);
+                totalImported++;
+              }
+            } catch (e) {
+              // fallback: attempt put and count as imported on success
+              try { await env.WEBHOOK_KV.put(key, body); totalImported++; } catch (err) { throw err; }
+            }
+          }
+        } catch (e) {
+          // Emit a console.error so wrangler tail can capture stack/message
+          try { console.error('backfill_put_failed', { id: d && (d.id||d.comment_id)||null, error: e && e.message ? e.message : String(e), stack: e && e.stack ? e.stack : null }); } catch(_){}
+          errors++;
+          // collect up to 200 error examples for the HTTP response
+          if (errorDetails.length < 200) errorDetails.push({ id: d && (d.id||d.comment_id)||null, key: (typeof key !== 'undefined' ? key : null), error: e && e.message ? e.message : String(e) });
+          // If this appears to be a KV daily/quota limit, stop further processing to avoid noisy failures
+          try {
+            const emsg = String(e && e.message ? e.message : '').toLowerCase();
+            if (emsg.includes('limit exceeded') || emsg.includes('kv put() limit exceeded') || emsg.includes('quota')) {
+              quotaExceeded = true;
+              // break out of the for loop
+              break;
+            }
+          } catch (_) {}
+        }
       }
 
+      // if quota exceeded, abort outer loop
+      if (quotaExceeded) break;
       // if less than perPage returned, finish
       if (items.length < perPage) break;
       page++;
@@ -537,7 +577,10 @@ async function handleAdminBackfill(request, env) {
     // bump version
     try { await env.WEBHOOK_KV.put('events:version', String(Date.now())); } catch (e) { console.warn('version put failed', e); }
 
-    return new Response(JSON.stringify({ imported: totalImported, errors }), { status: 200, headers: jsonHeaders(env, request) });
+  // return more detailed error information to help diagnose failures
+  const respPayload = { imported: totalImported, errors, errorDetails };
+  if (quotaExceeded) respPayload.quotaExceeded = true;
+  return new Response(JSON.stringify(respPayload), { status: 200, headers: jsonHeaders(env, request) });
   } catch (e) {
     return new Response(JSON.stringify({ error: 'backfill_failed', detail: e && e.message ? e.message : String(e) }), { status: 500, headers: jsonHeaders(env, request) });
   }
@@ -808,6 +851,86 @@ async function handleTrainers(request, env) {
     });
   } catch (e) {
     // ignore
+  }
+
+  // Try to use cached trainers list from KV (if present and fresh), else fetch from Yclients
+  try {
+    const url = new URL(request.url);
+    const refresh = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
+    const companyId = url.searchParams.get('company_id') || env.YCLIENTS_COMPANY_ID || null;
+    // attempt to read cached trainers list
+    if (!refresh && env.WEBHOOK_KV && typeof env.WEBHOOK_KV.get === 'function') {
+      try {
+        const updated = await env.WEBHOOK_KV.get('trainers:updated');
+        const listRaw = await env.WEBHOOK_KV.get('trainers:list');
+        if (listRaw) {
+          let listParsed = null;
+          try { listParsed = JSON.parse(listRaw); } catch (_) { listParsed = null; }
+          if (Array.isArray(listParsed)) {
+            // seed trainers map with fetched values (counts will be incremented when scanning KV events)
+            listParsed.forEach(s => {
+              if (!s || !s.id) return;
+              trainers.set(String(s.id), { id: String(s.id), name: s.name || (STAFF_MAP[String(s.id)] || `Тренер ${s.id}`), count: 0 });
+            });
+          }
+        }
+        // If trainers list missing or refresh requested, attempt to fetch and cache from Yclients
+        if ((refresh || !listRaw) && companyId) {
+          const fetched = await fetchAndCacheStaff(companyId);
+          if (Array.isArray(fetched)) {
+            fetched.forEach(s => {
+              if (!s || !s.id) return;
+              trainers.set(String(s.id), { id: String(s.id), name: s.name || (STAFF_MAP[String(s.id)] || `Тренер ${s.id}`), count: 0 });
+            });
+          }
+        }
+      } catch (e) {
+        // ignore KV read errors and fall back to scanning events
+      }
+    } else if (env.WEBHOOK_KV && typeof env.WEBHOOK_KV.get === 'function' && companyId) {
+      // forced refresh
+      try { const fetched = await fetchAndCacheStaff(companyId); if (Array.isArray(fetched)) fetched.forEach(s => trainers.set(String(s.id), { id: String(s.id), name: s.name || (STAFF_MAP[String(s.id)] || `Тренер ${s.id}`), count: 0 })); } catch(e){}
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // Helper: try to fetch staff list from Yclients and store in KV for caching
+  async function fetchAndCacheStaff(companyId) {
+    try {
+      const partner = env.YCLIENTS_PARTNER_TOKEN || DEV_PARTNER_FALLBACK;
+      const user = env.YCLIENTS_USER_TOKEN || DEV_USER_FALLBACK;
+      if (!partner || !companyId) return null;
+      const target = new URL(`${YCLIENTS_API_BASE}/api/v1/staff/${encodeURIComponent(companyId)}/`);
+      const headers = {
+        'Accept': 'application/vnd.yclients.v2+json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${partner}` + (user ? `, User ${user}` : '')
+      };
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      let resp;
+      try { resp = await fetch(target.toString(), { method: 'GET', headers, signal: controller.signal }); }
+      finally { clearTimeout(timeout); }
+      if (!resp.ok) return null;
+      const txt = await resp.text();
+      let parsed = null;
+      try { parsed = JSON.parse(txt); } catch (_) { parsed = null; }
+      // parsed.data is expected to be an array of staff entries
+      const staffArr = (parsed && Array.isArray(parsed.data)) ? parsed.data : (Array.isArray(parsed) ? parsed : []);
+      const mapped = staffArr.map(s => ({ id: String(s.id || s.staff_id || s.user_id || ''), name: s.name || s.full_name || s.first_name || null } )).filter(x=>x.id);
+      // store in KV
+      if (env.WEBHOOK_KV && typeof env.WEBHOOK_KV.put === 'function') {
+        try {
+          await env.WEBHOOK_KV.put('trainers:list', JSON.stringify(mapped));
+          await env.WEBHOOK_KV.put('trainers:updated', String(Date.now()));
+        } catch (e) { /* best-effort */ }
+      }
+      return mapped;
+    } catch (e) {
+      console.warn('fetchAndCacheStaff failed', e);
+      return null;
+    }
   }
 
   // If WEBHOOK_KV bound, scan all keys and collect master_id/master_name from stored events
