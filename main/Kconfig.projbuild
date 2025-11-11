@@ -1,0 +1,3 @@
+# Project-specific Kconfig (optional).
+# This file intentionally defines no options.
+# Keep it as UTF-8 (no BOM), use '#' for comments only.

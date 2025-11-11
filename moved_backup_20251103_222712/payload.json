@@ -1,8 +1,0 @@
-﻿{
-  "data": {
-    "text": "Тестовый webhook (manual HMAC test)",
-    "id": 5571628,
-    "date": "2025-10-30 22:28:35"
-  },
-  "event": "comment.created"
-}
