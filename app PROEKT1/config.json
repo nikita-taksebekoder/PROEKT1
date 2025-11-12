@@ -2,6 +2,7 @@
   "autostart": false,
   "minimized": false,
   "keep_led_on_disconnected": false,
+  "loop_protection": true,
   "brightness": 255,
   "led_profiles": {
     "Стандарт": {

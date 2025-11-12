@@ -28,6 +28,7 @@
 # Python
 __pycache__/
 .pytest_cache/
+.venv/
 
 # Managed components (check if you need to keep any)
 /components/esp_littlefs/

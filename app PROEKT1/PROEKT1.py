@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF, QRectF
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve, Property, QSize
 from PySide6.QtGui import QIcon
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPixmap, QPainterPath, QImage
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPixmap, QPainterPath, QImage, QFontMetrics
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF, QRectF, QEvent
 
 # Helper mixin: drag-to-move for frameless windows and subtle drop shadow
@@ -113,6 +113,8 @@ _rpm2 = 0
 _water_lock = threading.Lock()
 _water_temp = "--"
 _water_last_ts = 0.0
+_loop_status_lock = threading.Lock()
+_loop_status_code = 0  # default to disabled until first read; -1=unknown, 1=connected, 2=broken
 _fan_curve = [{'s': 100.0}]
 _last_preset_name = '--'
 _ble_last_address = None
@@ -128,6 +130,7 @@ RPM_CHAR_UUID = "0000ffe5-0000-1000-8000-00805f9b34fb"
 HOURS_CHAR_UUID = "0000ffe6-0000-1000-8000-00805f9b34fb"
 WATER_CHAR_UUID = "0000ffe7-0000-1000-8000-00805f9b34fb"
 CONTROL_CHAR_UUID = "0000ffe9-0000-1000-8000-00805f9b34fb"
+LOOP_STAT_CHAR_UUID = "0000ffea-0000-1000-8000-00805f9b34fb"  # петля защиты (статус)
 
 def _set_rpm(r1, r2, flags, src=""):
     global _rpm1, _rpm2
@@ -265,6 +268,23 @@ class BLETempSender(threading.Thread):
                 if not client.is_connected:
                     return False
                 self.emitter.signal.emit("BLE: Подключено")
+                # Подписка на уведомления статуса петли (мгновенные обновления UI)
+                try:
+                    def _on_loop_notify(sender: int, data: bytearray):
+                        try:
+                            code = int(data[0]) if data and len(data) >= 1 else -1
+                        except Exception:
+                            code = -1
+                        if code != -1:
+                            with _loop_status_lock:
+                                global _loop_status_code
+                                _loop_status_code = code
+                            # Сообщение в UI-поток, чтобы обновить немедленно
+                            self.emitter.signal.emit(f"LOOP:{code}")
+                    await client.start_notify(LOOP_STAT_CHAR_UUID, _on_loop_notify)
+                except Exception as e:
+                    print(f"BLE: не удалось подписаться на LOOP notify: {e}")
+                # Сохраняем текущий локальный статус; устройство синхронизируем отдельной командой LP
                 while not self.stop_flag:
                     # Очередь команд
                     try:
@@ -289,6 +309,17 @@ class BLETempSender(threading.Thread):
                                 elif kind == "ctrl":
                                     print(f"Sending control cmd, len={len(payload)}")
                                     await client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False)
+                                elif kind == "read_loop_status_once":
+                                    try:
+                                        data = await client.read_gatt_char(LOOP_STAT_CHAR_UUID)
+                                        if data and len(data) >= 1:
+                                            code = int(data[0])
+                                            with _loop_status_lock:
+                                                global _loop_status_code
+                                                _loop_status_code = code
+                                            self.emitter.signal.emit(f"LOOP:{code}")
+                                    except Exception:
+                                        pass
                             except Exception as e:
                                 print(f"BLE cmd error: {e}")
                     except queue.Empty:
@@ -327,6 +358,7 @@ class BLETempSender(threading.Thread):
                         global_pump_hours = data
                     except Exception:
                         pass
+                    # Статус петли теперь приходит по notify; периодическое чтение необязательно
                     await asyncio.sleep(1)
         except Exception as e:
             self.emitter.signal.emit(f"BLE: ошибка {e}")
@@ -1932,6 +1964,14 @@ class SettingsDialog(QDialog, FramelessWindowMixin):
             self.keep_led_cb.setChecked(False)
         self.keep_led_cb.setStyleSheet("QCheckBox { color: #FFFFFF; font-size: 14pt; } QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #FFFFFF; border-radius: 7px; background-color: #1e1e1e; } QCheckBox::indicator:checked { background-color: #7C4DFF; }")
         content_layout.addWidget(self.keep_led_cb)
+        # Защита гидролинии (в прошивке: LP)
+        self.loopprot_cb = QCheckBox("Защита гидролинии (стоп при разрыве)")
+        try:
+            self.loopprot_cb.setChecked(getattr(parent, 'loop_protection_enabled', False))
+        except Exception:
+            self.loopprot_cb.setChecked(False)
+        self.loopprot_cb.setStyleSheet("QCheckBox { color: #FFFFFF; font-size: 14pt; } QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #FFFFFF; border-radius: 7px; background-color: #1e1e1e; } QCheckBox::indicator:checked { background-color: #00BFA5; }")
+        content_layout.addWidget(self.loopprot_cb)
         # Счетчик моточасов (всегда активен, без возможности выключения)
         always_on_label = QLabel("Счётчик моточасов: активен")
         always_on_label.setStyleSheet("color: #FFFFFF; font-size: 12pt;")
@@ -1998,6 +2038,8 @@ class SettingsDialog(QDialog, FramelessWindowMixin):
         return self.keep_led_cb.isChecked()
 
     # pump hours is always on; no getter needed
+    def get_loopprot(self):
+        return self.loopprot_cb.isChecked()
     def get_pump_hours(self):
         return True
 
@@ -2119,6 +2161,26 @@ class TriStateSwitch(QWidget):
         self._state = 0
         self._suppress_emit = False
 
+        # Soft-block mode: allow dragging but do not fix to "работа/продувка",
+        # keep pause color and show rotating helper messages.
+        self._soft_blocked = False
+        self._soft_msgs = ["подключите гидролинии", "проверьте контакты"]
+        self._soft_msg_idx = 0
+        self._soft_timer = QTimer(self)
+        self._soft_timer.setSingleShot(False)
+        self._soft_timer.setInterval(3000)
+        self._soft_timer.timeout.connect(self._on_soft_tick)
+
+        # Overlay text (takes precedence over normal labels; ignored when soft-blocked)
+        self._overlay_text = None  # type: Optional[str]
+        # Marquee scrolling for long overlay text
+        self._marquee_enabled = False
+        self._marquee_offset = 0
+        self._marquee_timer = QTimer(self)
+        self._marquee_timer.setSingleShot(False)
+        self._marquee_timer.setInterval(40)  # ~25 FPS
+        self._marquee_timer.timeout.connect(self._on_marquee_tick)
+
         # Colors (reference)
         self._track_bg = QColor(240, 243, 247)   # light gray
         self._track_border = QColor(215, 219, 225)
@@ -2190,7 +2252,9 @@ class TriStateSwitch(QWidget):
         p.drawRoundedRect(shadow, radius, radius)
 
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self._pill_colors[self._state])
+        # Keep pause color when soft-blocked
+        color_idx = 0 if self._soft_blocked else self._state
+        p.setBrush(self._pill_colors[color_idx])
         p.drawRoundedRect(pill, radius, radius)
 
         # Label in the pill
@@ -2202,7 +2266,34 @@ class TriStateSwitch(QWidget):
         font.setPointSize(max(8, pt))
         font.setBold(False)
         p.setFont(font)
-        p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), labels[self._state])
+        # Choose text with precedence: overlay (if not soft-blocked) -> soft-block hints -> default label
+        text = labels[self._state]
+        if not self._soft_blocked and self._overlay_text:
+            text = self._overlay_text
+        elif self._soft_blocked:
+            try:
+                text = self._soft_msgs[self._soft_msg_idx % len(self._soft_msgs)]
+            except Exception:
+                text = "подключите гидролинии"
+        # Draw text, enabling marquee if requested and too long
+        fm = QFontMetrics(font)
+        text_width = fm.horizontalAdvance(text)
+        view_rect = pill.adjusted(8, 0, -8, 0)
+        if (not self._soft_blocked) and self._overlay_text and self._marquee_enabled and text_width > view_rect.width():
+            p.save()
+            p.setClipRect(pill)
+            # Two copies for seamless wrap
+            gap = int(view_rect.height() * 0.4) + 20
+            total = text_width + gap
+            x0 = view_rect.left() - (self._marquee_offset % max(1, total))
+            y = view_rect.top()
+            r1 = QRectF(x0, y, text_width, view_rect.height())
+            r2 = QRectF(x0 + total, y, text_width, view_rect.height())
+            p.drawText(r1, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
+            p.drawText(r2, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
+            p.restore()
+        else:
+            p.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
 
     # Public: match web button metrics
     def setMetrics(self, height_px: int, text_pt: Optional[int] = None):
@@ -2232,11 +2323,17 @@ class TriStateSwitch(QWidget):
         if not self._dragging:
             return
         self._dragging = False
-        # Snap to nearest third
-        snap = round(self._posf * 2.0) / 2.0  # 0.0, 0.5, 1.0
-        new_state = int(round(snap * 2.0))  # 0,1,2
-        self._animate_to_posf(snap)
-        self._apply_state(new_state, user=True)
+        if self._soft_blocked:
+            # Always return to STOP and emit state=0 only
+            self._animate_to_posf(0.0)
+            if self._state != 0:
+                self._apply_state(0, user=True)
+        else:
+            # Snap to nearest third
+            snap = round(self._posf * 2.0) / 2.0  # 0.0, 0.5, 1.0
+            new_state = int(round(snap * 2.0))  # 0,1,2
+            self._animate_to_posf(snap)
+            self._apply_state(new_state, user=True)
 
     def _animate_to_posf(self, v: float):
         self._anim.stop()
@@ -2259,7 +2356,8 @@ class TriStateSwitch(QWidget):
     def setState(self, st: int, animated: bool = True, external: bool = False):
         self._suppress_emit = external  # suppress echo back if external
         st = max(0, min(2, int(st)))
-        self._state = st
+        # Even in soft block, external state changes (e.g. forced STOP) should update label mapping
+        self._state = st if not self._soft_blocked else 0
         target = [0.0, 0.5, 1.0][st]
         if animated:
             self._animate_to_posf(target)
@@ -2271,6 +2369,55 @@ class TriStateSwitch(QWidget):
 
     def state(self) -> int:
         return self._state
+
+    def setSoftBlocked(self, on: bool):
+        on = bool(on)
+        if self._soft_blocked == on:
+            return
+        self._soft_blocked = on
+        self._soft_msg_idx = 0
+        if on:
+            # Ensure pill shows pause color and text immediately
+            self._soft_timer.start()
+            # Snap position back to STOP smoothly
+            self._animate_to_posf(0.0)
+            # Do not emit here to avoid sending duplicate SP; MainWindow logic handles STOP
+        else:
+            self._soft_timer.stop()
+        self.update()
+
+    def _on_soft_tick(self):
+        try:
+            self._soft_msg_idx = (self._soft_msg_idx + 1) % max(1, len(self._soft_msgs))
+        except Exception:
+            self._soft_msg_idx = 0
+        self.update()
+
+    def setOverlayText(self, text: Optional[str], marquee: bool = False):
+        # Ignore overlay when soft-blocked; soft messages have priority
+        new_text = (text or None)
+        new_marq = bool(marquee)
+        same_text = (self._overlay_text == new_text)
+        same_marq = (self._marquee_enabled == new_marq)
+        self._overlay_text = new_text
+        self._marquee_enabled = new_marq
+        # Only reset offset if content/state changed
+        if not (same_text and same_marq):
+            self._marquee_offset = 0
+        # Start/stop marquee timer lazily; actual need checked in paintEvent for width
+        if self._overlay_text and self._marquee_enabled:
+            self._marquee_timer.start()
+        else:
+            self._marquee_timer.stop()
+        self.update()
+
+    def clearOverlayText(self):
+        self.setOverlayText(None, marquee=False)
+
+    def _on_marquee_tick(self):
+        # Increase monotonically; wrapping handled in paintEvent by modulo text cycle length
+        self._marquee_offset += 1
+        self.update()
 
 
 class MainWindow(QMainWindow):
@@ -2304,6 +2451,13 @@ class MainWindow(QMainWindow):
         self._auto_return_timer = QTimer(self)
         self._auto_return_timer.setSingleShot(True)
         self._auto_return_timer.timeout.connect(self._on_auto_return_timer)
+        # Автозапуск после подключения гидролиний (обратный отсчёт)
+        self._autostart_countdown_active = False
+        self._autostart_secs = 0
+        self._autostart_timer = QTimer(self)
+        self._autostart_timer.setSingleShot(False)
+        self._autostart_timer.setInterval(1000)
+        self._autostart_timer.timeout.connect(self._on_autostart_tick)
         central = QWidget()
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(40, 40, 40, 40)
@@ -2350,6 +2504,11 @@ class MainWindow(QMainWindow):
         self.info_label.setStyleSheet("font-size: 13pt; color: #CCCCCC;")
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.info_label)
+        # Статус гидролиний
+        self.loop_label = QLabel("Гидролинии: --")
+        self.loop_label.setStyleSheet("font-size: 13pt; color: #CCCCCC;")
+        self.loop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(self.loop_label)
         main_layout.addSpacing(40)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
@@ -2389,6 +2548,7 @@ class MainWindow(QMainWindow):
         self.autostart = False
         self.minimized = False
         self.keep_led_on_disconnected = False
+        self.loop_protection_enabled = False
         self.pump_hours = True
         self.led_custom_colors = [QColor(0, 0, 0) for _ in range(20)]
         self.led_config_loaded = False
@@ -2501,6 +2661,8 @@ class MainWindow(QMainWindow):
 
     def update_ui(self):
         target_fan = 0.0
+        have_temp = False
+        temp_val = 0.0
         cpu, gpu = get_current_temps()
         self.cpu_label.setText(f"CPU: {cpu} °C")
         self.gpu_label.setText(f"GPU: {gpu} °C")
@@ -2530,6 +2692,8 @@ class MainWindow(QMainWindow):
             else:
                 temp = max(float(cpu), float(gpu))
                 src = "MAX"
+            have_temp = True
+            temp_val = float(temp)
             target_fan = self.interpolate_curve(self.fan_points, temp)
             target_pump = self.interpolate_curve(self.pump_points, temp, is_pump=True)
             self.targets = f"Цели: 🌀 {int(round(target_fan))}% 💧 {int(round(target_pump))}% (ориентир: {src})"
@@ -2541,6 +2705,62 @@ class MainWindow(QMainWindow):
         else:
             self.targets = "Цели: 🌀 --% 💧 --%"
         self.info_label.setText(f'<html><body><p>{self.targets}</p><p>Профиль: {_last_preset_name}</p><p>{self.link_status}</p></body></html>')
+        # Обновление статуса гидролиний из глобального кода
+        # Отображение стойкого дефолта до первого чтения: если код ещё -1 и локальный флаг выключен
+        try:
+            with _loop_status_lock:
+                code = _loop_status_code
+            if code == -1 and not self.loop_protection_enabled:
+                code = 0
+            mapping = {
+                0: "Гидролинии: защита выключена",
+                1: "Гидролинии: подключены",
+                2: "Гидролинии: отключены"
+            }
+            self.loop_label.setText(mapping.get(code, "Гидролинии: --"))
+        except Exception:
+            code = -1
+        # Блокировка режима работы если защита включена и петля разорвана
+        try:
+            lock_needed = self.loop_protection_enabled and code == 2
+            if lock_needed:
+                # Принудительно UI в стоп
+                if self.tri_switch.state() != 0:
+                    self.tri_switch.setState(0, animated=False, external=True)
+                # Мягкая блокировка: разрешить перетаскивание без смены режима
+                self.tri_switch.setSoftBlocked(True)
+            else:
+                self.tri_switch.setSoftBlocked(False)
+        except Exception:
+            pass
+        # Отображение статуса ожидания целевых температур в режиме "работа"
+        waiting_for_targets = False
+        try:
+            if (self.tri_switch.state() == 1) and not getattr(self, '_autostart_countdown_active', False) and not self.tri_switch._soft_blocked:
+                # Новый критерий: если целевые значения по кривым равны 0 (ничего не нужно крутить), ждём достижения порога
+                tf = 0.0
+                tp = 0.0
+                try:
+                    tf = float(self.interpolate_curve(self.fan_points, temp_val)) if have_temp else 0.0
+                except Exception:
+                    tf = 0.0
+                try:
+                    tp = float(self.interpolate_curve(self.pump_points, temp_val, is_pump=True)) if have_temp else 0.0
+                except Exception:
+                    tp = 0.0
+                waiting_for_targets = (tf <= 0.0 and tp <= 0.0)
+                if waiting_for_targets:
+                    # Включим скролл, если текст не помещается
+                    self.tri_switch.setOverlayText("ожидаю целевые температуры", marquee=True)
+                else:
+                    if getattr(self.tri_switch, '_overlay_text', None) == "ожидаю целевые температуры":
+                        self.tri_switch.clearOverlayText()
+            else:
+                if getattr(self.tri_switch, '_overlay_text', None) == "ожидаю целевые температуры":
+                    self.tri_switch.clearOverlayText()
+        except Exception:
+            waiting_for_targets = False
+            pass
         # Work mode flag: аварии только в режиме "работа"
         try:
             work_mode = (self.tri_switch.state() == 1) and bool(getattr(self, 'system_running', True)) and not bool(getattr(self, 'purge_active', False))
@@ -2557,7 +2777,7 @@ class MainWindow(QMainWindow):
             fan1_message = ""
             fan1_icon = str(_rpm1)
             # Prefer device flag; fallback to heuristic
-            fan1_should_alarm = work_mode and (f1_flag or (target_fan > 0 and self.is_fan_alarm(target_fan, _rpm1)))
+            fan1_should_alarm = work_mode and (not waiting_for_targets) and (f1_flag or (target_fan > 0 and self.is_fan_alarm(target_fan, _rpm1)))
             if fan1_should_alarm:
                 # Check 10s grace period after connection
                 # If device raised flag, ignore local grace; trust firmware
@@ -2582,7 +2802,7 @@ class MainWindow(QMainWindow):
             # Fan 2 alarm logic
             fan2_message = ""
             fan2_icon = str(_rpm2)
-            fan2_should_alarm = work_mode and (f2_flag or (target_fan > 0 and self.is_fan_alarm(target_fan, _rpm2)))
+            fan2_should_alarm = work_mode and (not waiting_for_targets) and (f2_flag or (target_fan > 0 and self.is_fan_alarm(target_fan, _rpm2)))
             if fan2_should_alarm:
                 # Check 10s grace period after connection
                 in_grace = (not f2_flag) and (self.connection_start_time and (time.time() - self.connection_start_time < 10))
@@ -2634,6 +2854,7 @@ class MainWindow(QMainWindow):
                 self.autostart = data.get("autostart", False)
                 self.minimized = data.get("minimized", False)
                 self.keep_led_on_disconnected = data.get("keep_led_on_disconnected", False)
+                self.loop_protection_enabled = data.get("loop_protection", False)
                 self.brightness = data.get("brightness", 255)
                 # remove legacy test counter if present
                 # Load custom_colors
@@ -2724,6 +2945,7 @@ class MainWindow(QMainWindow):
                     "autostart": self.autostart,
                     "minimized": self.minimized,
                     "keep_led_on_disconnected": self.keep_led_on_disconnected,
+                    "loop_protection": self.loop_protection_enabled,
                     "brightness": self.brightness,
                     "led_profiles": self.led_profiles
                 }, f, ensure_ascii=False, indent=2)
@@ -2774,9 +2996,56 @@ class MainWindow(QMainWindow):
                 self.send_keep_led_flag()
             except Exception:
                 pass
+            # loop protection flag
+            try:
+                self.loop_protection_enabled = dialog.get_loopprot()
+                self.send_loopprot_flag()
+            except Exception:
+                pass
             self.save_app_config()
 
     def update_link_status(self, status):
+        # Специальные внутрение уведомления от BLE-потока (мгновенные реакции)
+        if status.startswith("LOOP:"):
+            try:
+                code = int(status.split(":", 1)[1])
+            except Exception:
+                code = -1
+            # Немедленно обновим блокировку и подпись (не ждём таймера)
+            try:
+                lock_needed = getattr(self, 'loop_protection_enabled', False) and code == 2
+                if lock_needed:
+                    if hasattr(self, 'tri_switch') and self.tri_switch.state() != 0:
+                        self.tri_switch.setState(0, animated=False, external=True)
+                    if hasattr(self, 'tri_switch'):
+                        self.tri_switch.setSoftBlocked(True)
+                    # Если шёл отсчёт автозапуска — отменяем
+                    if getattr(self, '_autostart_countdown_active', False):
+                        self._autostart_timer.stop()
+                        self._autostart_countdown_active = False
+                        try:
+                            self.tri_switch.clearOverlayText()
+                        except Exception:
+                            pass
+                else:
+                    if hasattr(self, 'tri_switch'):
+                        self.tri_switch.setSoftBlocked(False)
+                    # Автозапуск: при появлении "подключены" и включённой защите, если мы в Стоп
+                    try:
+                        if getattr(self, 'loop_protection_enabled', False) and code == 1:
+                            if not getattr(self, '_autostart_countdown_active', False) and self.tri_switch.state() == 0 and not getattr(self, 'purge_active', False):
+                                self._start_autostart_countdown(5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Перерисуем UI сейчас
+            try:
+                self.update_ui()
+            except Exception:
+                pass
+            return
+        # Обычный текст статуса связи
         parts = status.split(": ", 1)
         if len(parts) == 2:
             transport, rest = parts
@@ -2793,6 +3062,10 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(200, self.resend_current_led_profile)
                 # Переотправить флаг keep_led если включен
                 QTimer.singleShot(400, self.send_keep_led_flag)
+                # Переотправить флаг защиты гидролинии
+                QTimer.singleShot(450, self.send_loopprot_flag)
+                # Запросим текущий статус петли один раз (на случай если notify не пришёл)
+                QTimer.singleShot(600, self.request_loop_status_once)
                 # Гарантированно запускать систему в режим "работа" на каждом подключении
                 # (даже если в прошлой сессии был "стоп"). Дублируем через 1.5с для надёжности.
                 QTimer.singleShot(100, lambda: self.send_control('ST'))
@@ -2800,6 +3073,44 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+
+    def _start_autostart_countdown(self, seconds: int = 5):
+        try:
+            self._autostart_secs = int(max(1, seconds))
+        except Exception:
+            self._autostart_secs = 5
+        self._autostart_countdown_active = True
+        try:
+            self.tri_switch.setOverlayText(f"работаю через {self._autostart_secs}", marquee=False)
+        except Exception:
+            pass
+        self._autostart_timer.start()
+
+    def _on_autostart_tick(self):
+        if not self._autostart_countdown_active:
+            self._autostart_timer.stop()
+            return
+        self._autostart_secs -= 1
+        if self._autostart_secs > 0:
+            try:
+                self.tri_switch.setOverlayText(f"работаю через {self._autostart_secs}", marquee=False)
+            except Exception:
+                pass
+            return
+        # Countdown finished
+        self._autostart_timer.stop()
+        self._autostart_countdown_active = False
+        try:
+            # Clear overlay and switch to RUN visually
+            self.tri_switch.clearOverlayText()
+            self.tri_switch.setState(1, animated=True, external=True)
+        except Exception:
+            pass
+        # Send start command to device
+        try:
+            self.send_control('ST')
+        except Exception:
+            pass
     def resend_current_led_profile(self):
         """Переотправить текущий LED-профиль после подключения BLE/USB.
         Восстанавливает режим, цвета/градиент и яркость на устройстве.
@@ -2862,6 +3173,31 @@ class MainWindow(QMainWindow):
             print(f"DEBUG: send_keep_led_flag -> {val}")
         except Exception as e:
             print(f"keep_led_flag error: {e}")
+
+    def send_loopprot_flag(self):
+        """Отправка флага защиты гидролинии.
+        Формат: 'LP' + 1 байт (0 или 1).
+        """
+        try:
+            val = 1 if getattr(self, 'loop_protection_enabled', False) else 0
+            payload = b'LP' + bytes([val])
+            tx_cmd_queue.put(("ctrl", payload))
+            print(f"DEBUG: send_loopprot_flag -> {val}")
+            # Не ждём очередного тика: UI обновится сразу по notify, но подстрахуемся —
+            # если notify не придёт, дернём разовый запрос
+            QTimer.singleShot(300, self.request_loop_status_once)
+        except Exception as e:
+            print(f"loopprot_flag error: {e}")
+
+    def request_loop_status_once(self):
+        """Разовый запрос статуса петли (для BLE): если очередь и поток активны, он выполнит read.
+        Для USB пока не реализовано (статус доступен только по BLE).
+        """
+        try:
+            # Используем ту же BLE очередь: специальный псевдокомандный маркер
+            tx_cmd_queue.put(("read_loop_status_once", b""))
+        except Exception:
+            pass
 
     def on_purge_clicked(self):
         self.purge_active = True

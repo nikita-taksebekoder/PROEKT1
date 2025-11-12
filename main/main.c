@@ -89,6 +89,7 @@ static uint8_t own_addr_type;
 #define HOURS_CHAR_UUID      0xFFE6  /* pump hours total (read/write) */
 #define WATER_CHAR_UUID      0xFFE7  /* water temp (read/notify) */
 #define CTRL_CHAR_UUID       0xFFE9  /* control plane: ST/SP/PG/etc (write) */
+#define LOOP_STAT_CHAR_UUID  0xFFEA  /* loop protection status (read/notify) */
 #define LED_GPIO             2
 #define FAN_PWM_GPIO         16
 #define PUMP_PWM_GPIO        17
@@ -129,6 +130,10 @@ static uint8_t own_addr_type;
 #define LED_STRIP_RES_HZ     (10 * 1000 * 1000)
 #define LED_BRIGHT_DEF       64
 
+/* Loop protection GPIOs (hose presence) */
+#define LOOP_OUT_GPIO        26  /* output: drives test level */
+#define LOOP_IN_GPIO         33  /* input: reads returned level */
+
 /* Ranges */
 #define TEMP_MIN_C           30.0f
 #define TEMP_MAX_C           110.0f
@@ -144,6 +149,8 @@ static uint8_t own_addr_type;
 #define LEDC_PUMP_FREQ_HZ      25000
 #define LEDC_TIMER_RES         LEDC_TIMER_10_BIT
 #define LEDC_DUTY_MAX          ((1U << 10) - 1)
+/* Solenoid valve PWM (use silent 25 kHz as well to avoid coil whine) */
+#define LEDC_VALVE_FREQ_HZ     30000
 
 /* Pump boost profile after purge->stop sequence: durations in ms */
 #define PUMP_BOOST_PHASE1_MS   2000  /* 0% -> 100% */
@@ -278,6 +285,7 @@ static uint16_t g_fan_cfg_val_handle = 0;
 static uint16_t g_pump_cfg_val_handle = 0;
 static uint16_t g_rpm_val_handle = 0; /* RPM notify/read */
 static uint16_t g_water_val_handle = 0; /* WATER notify/read */
+static uint16_t g_loop_stat_val_handle = 0; /* LOOP status read/notify */
 #endif
 
 static volatile int32_t g_cpu_temp_c = -1000;
@@ -380,6 +388,8 @@ static void tach_sample_and_publish(uint32_t interval_ms);
 
 static void uart_send_rp(int32_t rpm1, int32_t rpm2, uint32_t flags); /* UART RP TX */
 static void uart_send_wt(int32_t water_c);
+static void loopprot_task(void *arg);
+static int sp_try_lp(const uint8_t* d,size_t l,size_t* used);
 
 /* DS18B20 */
 static void ds18b20_task(void *arg);
@@ -397,6 +407,14 @@ static void rpm_autocalibrate(void);
 static volatile uint32_t g_forced_stop_deadline_ms = 0;
 static bool g_pwm_fan_attached = false;
 static bool g_pwm_pump_attached = false;
+static bool g_pwm_valve_attached = false;
+
+/* ===== Loop protection (hose presence) ===== */
+static volatile bool g_loopprot_enabled = false;   /* configurable flag (persisted) */
+static volatile bool g_loop_ok = true;             /* current physical continuity state */
+static volatile uint8_t g_loop_mismatch_ctr = 0;   /* debounce counters */
+static volatile uint8_t g_loop_match_ctr = 0;
+static volatile bool g_loop_last_drive = false;    /* last driven level on LOOP_OUT */
 
 /* ===== OLED (SSD1312/SSD1306) minimal driver ===== */
 #define OLED_SDA_GPIO      21
@@ -903,7 +921,7 @@ static void pump_pwm_set_percent(float pct){
     float duty_frac = clampf(v_drv / PUMP_SUPPLY_V, 0.0f, 1.0f);
     ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1));
     uint32_t duty = (uint32_t)lroundf(duty_frac * (float)LEDC_DUTY_MAX);
-    ESP_LOGI(TAG, "PUMP PWM: s=%.1f%% -> desired=%.2fV, drive=%.3fV, duty=%lu/%u (%.1f%%), f=%u Hz",
+    ESP_LOGD(TAG, "PUMP PWM: s=%.1f%% -> desired=%.2fV, drive=%.3fV, duty=%lu/%u (%.1f%%), f=%u Hz",
              s, (double)v_des, (double)v_drv, (unsigned long)duty, (unsigned)LEDC_DUTY_MAX, duty_frac*100.0f, (unsigned)LEDC_PUMP_FREQ_HZ);
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
@@ -1458,7 +1476,7 @@ static int led_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, v
 static void purge_start(void);
 static void purge_stop(void);
 
-/* Control characteristic write: expects 2-byte commands 'PG' or 'ST' */
+/* Control characteristic write: expects 2-3 byte commands 'PG'/'ST'/'SP' and 'LP'+<1|0> */
 static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
     if (ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
     uint16_t total=OS_MBUF_PKTLEN(ctxt->om);
@@ -1466,10 +1484,12 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     uint8_t cmd[4]={0}; if (total>sizeof(cmd)) total=sizeof(cmd);
     os_mbuf_copydata(ctxt->om,0,total,cmd);
     if (cmd[0]=='P' && cmd[1]=='G') {
+        if (g_loopprot_enabled && !g_loop_ok){ ESP_LOGW(TAG, "LOOP: broken, purge denied"); return 0; }
         g_purge_seen_since_last_stop = true; /* track that purge command was issued */
         purge_start();
     } else if (cmd[0]=='S' && cmd[1]=='T') {
         /* 'ST' -> start normal operation */
+        if (g_loopprot_enabled && !g_loop_ok){ ESP_LOGW(TAG, "LOOP: broken, start denied"); return 0; }
         g_system_running = true;
         g_forced_stop_deadline_ms = 0; /* clear guard */
         /* Re-attach channels if needed (mirrors UART handler) */
@@ -1549,6 +1569,43 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
                 if (!g_ble_connected && !g_usb_connected) leds_off();
             }
         }
+    } else if (cmd[0]=='L' && cmd[1]=='P') {
+        if (total >= 3){
+            bool en = (cmd[2] != 0);
+            g_loopprot_enabled = en;
+            nvs_handle_t h; if (nvs_open("sys", NVS_READWRITE, &h) == ESP_OK){
+                (void)nvs_set_u8(h, "loopprot", en?1:0);
+                (void)nvs_commit(h); nvs_close(h);
+            }
+            ESP_LOGI(TAG, "CTRL: loop protection %s", en?"ENABLED":"DISABLED");
+            /* Если включаем защиту и петля уже разорвана — немедленно принудительно STOP */
+            if (en && !g_loop_ok){
+                g_system_running = false;
+                fan_pwm_set_percent(0.0f);
+                pump_pwm_set_percent(0.0f);
+                (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+                gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
+                gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
+                g_pwm_fan_attached = false; g_pwm_pump_attached = false;
+                uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+                g_forced_stop_deadline_ms = now_ms + 1500u;
+                g_pump_boost_active = false;
+                if (g_purge_active) purge_stop();
+                ESP_LOGW(TAG, "LOOP: enforced STOP on enable (broken)");
+            }
+            /* Send status notify to subscribers (0/1/2) */
+            #if CONFIG_BT_NIMBLE_ENABLED
+            if (g_ble_connected && g_loop_stat_val_handle){
+                uint8_t code = en ? (g_loop_ok ? 1 : 2) : 0;
+                struct os_mbuf* om = ble_hs_mbuf_from_flat(&code, 1);
+                if (om) {
+                    int rc = ble_gatts_notify_custom(g_conn_handle, g_loop_stat_val_handle, om);
+                    if (rc != 0) ESP_LOGW(TAG, "LOOP notify(toggle) rc=%d", rc);
+                }
+            }
+            #endif
+        }
     }
     return 0;
 }
@@ -1573,6 +1630,19 @@ static int water_read_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
 }
 
 static uint32_t g_hours_last_save_ms = 0;
+
+/* Loop protection status read: returns 1 byte code
+   0 = protection disabled, 1 = loop connected (ok), 2 = loop broken */
+static int loop_stat_read_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
+    uint8_t code = 0;
+    if (g_loopprot_enabled) {
+        code = g_loop_ok ? 1 : 2;
+    } else {
+        code = 0;
+    }
+    int rc = os_mbuf_append(ctxt->om, &code, sizeof(code));
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
 
 static int hours_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR){
@@ -1610,6 +1680,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
           { .uuid=BLE_UUID16_DECLARE(RPM_CHAR_UUID),      .access_cb=rpm_read_cb,       .flags=BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
                       { .uuid=BLE_UUID16_DECLARE(HOURS_CHAR_UUID),    .access_cb=hours_access_cb,   .flags=BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE },
           { .uuid=BLE_UUID16_DECLARE(WATER_CHAR_UUID),    .access_cb=water_read_cb,     .flags=BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
+              { .uuid=BLE_UUID16_DECLARE(LOOP_STAT_CHAR_UUID),.access_cb=loop_stat_read_cb, .flags=BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
           { 0 }
       }
     },
@@ -1625,6 +1696,7 @@ static void gatt_register_cb(struct ble_gatt_register_ctxt *ctxt, void *){
         if(u16==RPM_CHAR_UUID)      g_rpm_val_handle     =ctxt->chr.val_handle;
         /* HOURS_CHAR_UUID has no notify handle; nothing to store here */
         if(u16==WATER_CHAR_UUID)    g_water_val_handle   =ctxt->chr.val_handle;
+        if(u16==LOOP_STAT_CHAR_UUID) g_loop_stat_val_handle = ctxt->chr.val_handle;
     }
 }
 
@@ -1950,6 +2022,19 @@ static int sp_try_lk(const uint8_t* d,size_t l,size_t* used){
    op='R' -> read request, device replies with 'HR'<blob>
    op='W' -> write request with blob (throttled save)
    op='F' -> write request with blob, force immediate save */
+/* NEW: Loop protection flag over UART: 'LP' + ('1' or '0') */
+static int sp_try_lp(const uint8_t* d,size_t l,size_t* used){
+    if (l < 3) return 0;
+    if (!(d[0]=='L' && d[1]=='P')){ *used=1; return -1; }
+    bool en = (d[2] != 0);
+    g_loopprot_enabled = en;
+    nvs_handle_t h; if (nvs_open("sys", NVS_READWRITE, &h) == ESP_OK){
+        (void)nvs_set_u8(h, "loopprot", en?1:0);
+        (void)nvs_commit(h); nvs_close(h);
+    }
+    ESP_LOGI(TAG, "UART: loop protection %s", en?"ENABLED":"DISABLED");
+    *used = 3; return 1;
+}
 static int sp_try_hr(const uint8_t* d,size_t l,size_t* used){
     if (l < 3) return 0;
     if (!(d[0]=='H' && d[1]=='R')){ *used=1; return -1; }
@@ -1989,7 +2074,8 @@ static void sp_feed(stream_parser_t* p,const uint8_t* data,size_t len){
         if(p->len>=2 && p->buf[0]=='F' && p->buf[1]=='C'){ int r=sp_try_fc(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='P' && p->buf[1]=='C'){ int r=sp_try_pc(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='L' && p->buf[1]=='X'){ int r=sp_try_lx(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
-    if(p->len>=3 && p->buf[0]=='L' && p->buf[1]=='K'){ int r=sp_try_lk(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
+        if(p->len>=3 && p->buf[0]=='L' && p->buf[1]=='K'){ int r=sp_try_lk(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
+        if(p->len>=3 && p->buf[0]=='L' && p->buf[1]=='P'){ int r=sp_try_lp(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='H' && p->buf[1]=='R'){ int r=sp_try_hr(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='P' && p->buf[1]=='G'){ int r=sp_try_pg(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='S' && p->buf[1]=='T'){ int r=sp_try_st(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
@@ -2287,30 +2373,85 @@ static void led_task(void *){
 /* Forward decl for valve helpers used in purge */
 static inline void valve_init(void);
 static inline void valve_set(bool active);
+static void valve_pwm_init(void);
+static void valve_pwm_set_percent(float pct);
 static void purge_task(void *arg){
     (void)arg;
     g_purge_active = true; g_purge_cancel = false;
-    ESP_LOGI(TAG, "PURGE: start");
+    ESP_LOGI(TAG, "ПРОДУВКА: старт");
     /* Step 0: immediately stop fans and pumps */
     fan_pwm_set_percent(0.0f);
     pump_pwm_set_percent(0.0f);
-    /* 3 seconds with pumps off */
-    uint32_t t = 0;
-    while (t < 3000 && !g_purge_cancel){ vTaskDelay(pdMS_TO_TICKS(50)); t += 50; }
-    if (!g_purge_cancel){
-        /* Activate valve (air) */
-        valve_set(true);
-        /* wait 1s */
-        t = 0; while (t < 1000 && !g_purge_cancel){ vTaskDelay(pdMS_TO_TICKS(50)); t += 50; }
+
+    /* Start valve PWM ramp in parallel with OFF-phase */
+    valve_pwm_init();
+    uint32_t start_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+    const uint32_t ramp_ms = 3000;             /* 3s smooth close */
+    const uint32_t off_ms = 1000;              /* OFF-phase (fans/pump off) */
+    const uint32_t air_pause_ms = 1000;        /* Air pause with pump OFF */
+    /* Pump profile: 2s ramp 40->100%, 5s hold 100%, 1s ramp down to 40%, then OFF */
+    const uint32_t pump_ramp_up_ms   = 1000;  /* 1s ramp 40->100 */
+    const uint32_t pump_hold_ms      = 7000;  /* 7s hold */
+    const uint32_t pump_ramp_down_ms = 1000;
+    const uint32_t pump_total_ms     = pump_ramp_up_ms + pump_hold_ms + pump_ramp_down_ms; /* 8000 */
+    const uint32_t pump_start_ms = start_ms + off_ms + air_pause_ms;
+    const uint32_t purge_end_ms  = pump_start_ms + pump_total_ms;
+    bool peak_logged = false;
+
+    const TickType_t step_ticks = pdMS_TO_TICKS(10); /* finer step for acoustics */
+    while (!g_purge_cancel){
+        uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+        uint32_t elapsed = now_ms - start_ms;
+
+        /* Valve PWM ramp: 40% -> 100% over ramp_ms, then hold 100% */
+        if (elapsed < ramp_ms){
+            float frac = (float)elapsed / (float)ramp_ms;
+            float v_pct = 40.0f + (60.0f * frac);
+            valve_pwm_set_percent(v_pct);
+        } else {
+            valve_pwm_set_percent(100.0f);
+        }
+
+        /* Pump control timeline with smooth profile */
+        if (now_ms < pump_start_ms){
+            /* OFF-phase (1s) and then air pause (1s) with pump OFF */
+            pump_pwm_set_percent(0.0f);
+        } else if (now_ms < purge_end_ms){
+            uint32_t pt = now_ms - pump_start_ms;
+            if (!peak_logged && pt >= pump_ramp_up_ms){
+                peak_logged = true;
+                ESP_LOGI(TAG, "ПРОДУВКА: пик оборотов помпы");
+            }
+            if (pt < pump_ramp_up_ms){
+                float frac = (float)pt / (float)pump_ramp_up_ms;          /* 0..1 */
+                float pct  = 40.0f + 60.0f * frac;                         /* 40 -> 100 */
+                pump_pwm_set_percent(pct);
+            } else if (pt < pump_ramp_up_ms + pump_hold_ms){
+                pump_pwm_set_percent(100.0f);                              /* hold */
+            } else {
+                uint32_t dt = pt - (pump_ramp_up_ms + pump_hold_ms);
+                float frac = (float)dt / (float)pump_ramp_down_ms;         /* 0..1 */
+                if (frac > 1.0f) frac = 1.0f;
+                float pct  = 100.0f - 60.0f * frac;                        /* 100 -> 40 */
+                pump_pwm_set_percent(pct);
+            }
+        } else {
+            break; /* timeline finished */
+        }
+
+        vTaskDelay(step_ticks);
+        if (g_purge_cancel){
+            pump_pwm_set_percent(0.0f);
+            valve_pwm_set_percent(0.0f);
+            break;
+        }
     }
-    if (!g_purge_cancel){
-        /* Run pumps at 60% for 12s with valve active */
-        pump_pwm_set_percent(60.0f);
-        t = 0; while (t < 12000 && !g_purge_cancel){ vTaskDelay(pdMS_TO_TICKS(50)); t += 50; }
-    }
+
     /* Stop pumps and deactivate valve */
     pump_pwm_set_percent(0.0f);
-    valve_set(false);
+    valve_pwm_set_percent(0.0f);
+
+    /* Loop protection GPIOs - moved to app_main init */
     g_purge_active = false;
     /* Mark that purge has completed; if system already in STOP (g_system_running==false) arm immediately */
     g_purge_completed_since_last_stop = true;
@@ -2321,7 +2462,7 @@ static void purge_task(void *arg){
             ESP_LOGI(TAG, "PUMP BOOST: auto-armed on purge completion (system stopped)");
         }
     }
-    ESP_LOGI(TAG, "PURGE: done%s (system_running=%d boost_armed=%d)", g_purge_cancel?" (cancelled)":"", (int)g_system_running, (int)g_pump_boost_armed);
+    ESP_LOGI(TAG, "ПРОДУВКА: завершено%s (system_running=%d boost_armed=%d)", g_purge_cancel?" (отменено)":"", (int)g_system_running, (int)g_pump_boost_armed);
     g_purge_cancel = false;
     g_purge_task = NULL;
     vTaskDelete(NULL);
@@ -2330,6 +2471,7 @@ static void purge_task(void *arg){
 static void purge_start(void){
     if (g_purge_active){ ESP_LOGW(TAG, "PURGE: already active"); return; }
     if (g_purge_task){ ESP_LOGW(TAG, "PURGE: task handle set"); return; }
+    if (g_loopprot_enabled && !g_loop_ok){ ESP_LOGW(TAG, "LOOP: broken, purge denied"); return; }
     /* Cancel any pending/active pump boost when starting purge */
     g_pump_boost_active = false;
     g_pump_boost_armed = false;
@@ -2379,15 +2521,59 @@ void app_main(void){
     gpio_set_direction(LED_GPIO,GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO,0);
 
+    /* Suppress noisy LEDC warnings on unusable pins (e.g., 16/17 on some modules) */
+    esp_log_level_set("ledc", ESP_LOG_ERROR);
+
     ensure_ledc_init_once();
     fan_pwm_set_percent(0.0f);
     pump_pwm_set_percent(0.0f);
-    valve_init();
+    /* Switch to PWM-based valve control */
+    valve_pwm_init();
+    valve_pwm_set_percent(0.0f);
 
     /* Tach inputs */
     tach_init();
 
     /* Калибровка тахометров отключена: используем сырые RPM */
+
+    /* Loop protection GPIOs + monitor task: init at boot */
+    {
+        gpio_config_t o={ .pin_bit_mask=(1ULL<<LOOP_OUT_GPIO), .mode=GPIO_MODE_OUTPUT,
+                          .pull_up_en=GPIO_PULLUP_DISABLE, .pull_down_en=GPIO_PULLDOWN_DISABLE, .intr_type=GPIO_INTR_DISABLE };
+        gpio_config(&o); gpio_set_level((gpio_num_t)LOOP_OUT_GPIO, 0);
+        gpio_config_t i={ .pin_bit_mask=(1ULL<<LOOP_IN_GPIO), .mode=GPIO_MODE_INPUT,
+                          .pull_up_en=GPIO_PULLUP_DISABLE, .pull_down_en=GPIO_PULLDOWN_ENABLE, .intr_type=GPIO_INTR_DISABLE };
+        gpio_config(&i);
+        /* Load loop protection flag from NVS ('sys': 'loopprot'), default OFF */
+        nvs_handle_t h; uint8_t v=0xFF; if (nvs_open("sys", NVS_READONLY, &h) == ESP_OK){
+            (void)nvs_get_u8(h, "loopprot", &v); nvs_close(h);
+        }
+        g_loopprot_enabled = (v==1)?true:false;
+        ESP_LOGI(TAG, "LOOP: protection %s (nvs=%u)", g_loopprot_enabled?"ENABLED":"DISABLED", (unsigned)v);
+        /* Kick a quick initial probe (toggle once) to avoid stale default before task converges */
+        bool in0 = gpio_get_level((gpio_num_t)LOOP_IN_GPIO) ? true : false;
+        gpio_set_level((gpio_num_t)LOOP_OUT_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        bool in1 = gpio_get_level((gpio_num_t)LOOP_IN_GPIO) ? true : false;
+        gpio_set_level((gpio_num_t)LOOP_OUT_GPIO, 0);
+        g_loop_ok = (in0 != in1); /* if input reacts to toggle, assume closed */
+        if (g_loopprot_enabled && !g_loop_ok){
+            ESP_LOGW(TAG, "LOOP: broken at boot, enforce STOP");
+            /* Enforce STOP same as SP */
+            g_system_running = false;
+            fan_pwm_set_percent(0.0f);
+            pump_pwm_set_percent(0.0f);
+            (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
+            gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
+            g_pwm_fan_attached = false; g_pwm_pump_attached = false;
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+            g_forced_stop_deadline_ms = now_ms + 1500u;
+            g_pump_boost_active = false;
+        }
+        xTaskCreate(loopprot_task, "loopprot", 2048, NULL, 5, NULL);
+    }
 
     /* UART */
     uart_init();
@@ -2395,6 +2581,8 @@ void app_main(void){
 
     /* DS18B20 reader */
     xTaskCreate(ds18b20_task, "ds18b20", 3072, NULL, 4, NULL);
+    
+    /* Loop protection monitor started above */
 
 #if CONFIG_BT_NIMBLE_ENABLED
     /* Manual, idempotent BLE init (Legacy VHCI-safe). */
@@ -2614,19 +2802,122 @@ static void oled_task(void *arg){
 
 /* ===== Valve (solenoid) control ===== */
 static inline void valve_init(void){
-    /* Add internal pulldown to keep line low if it briefly floats during init */
+    /* Redirect legacy init to PWM init */
+    valve_pwm_init();
+    valve_pwm_set_percent(0.0f);
+}
+/* Deprecated: binary valve control (use valve_pwm_set_percent instead) */
+static inline void valve_set(bool active){
+    /* Legacy fallback: map true->100%, false->0% via PWM for consistency */
+    if (!g_pwm_valve_attached) valve_pwm_init();
+    if (active) valve_pwm_set_percent(100.0f); else valve_pwm_set_percent(0.0f);
+}
+
+/* ===== Valve PWM (soft close/open) ===== */
+static void valve_pwm_init(void){
+    if (g_pwm_valve_attached) return;
+    /* Keep pulldown for safety */
     gpio_set_pull_mode((gpio_num_t)VALVE_GPIO, GPIO_PULLDOWN_ONLY);
 #if defined(GPIO_PULLDOWN_ENABLE) || defined(gpio_pulldown_en)
     gpio_pulldown_en((gpio_num_t)VALVE_GPIO);
 #endif
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << VALVE_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
-    gpio_set_level(VALVE_GPIO, 0); /* inactive = water */
+    /* Configure dedicated LEDC timer/channel for the valve to allow high-frequency PWM */
+    ledc_timer_config_t t_valve={ .speed_mode=LEDC_LOW_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
+                                  .timer_num=LEDC_TIMER_2, .freq_hz=LEDC_VALVE_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
+    ESP_ERROR_CHECK(ledc_timer_config(&t_valve));
+    ledc_channel_config_t c_valve={ .gpio_num=VALVE_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
+                                    .channel=LEDC_CHANNEL_2, .intr_type=LEDC_INTR_DISABLE,
+                                    .timer_sel=LEDC_TIMER_2, .duty=0, .hpoint=0 };
+    ESP_ERROR_CHECK(ledc_channel_config(&c_valve));
+    ESP_ERROR_CHECK(ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0));
+    g_pwm_valve_attached = true;
 }
-static inline void valve_set(bool active){ gpio_set_level(VALVE_GPIO, active ? 1 : 0); }
+
+static void valve_pwm_set_percent(float pct){
+    float p = clampf(pct, 0.0f, 100.0f);
+    if (!g_pwm_valve_attached){
+        valve_pwm_init();
+    }
+    uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+    if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
+        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+        return;
+    }
+    if (p <= 0.0f){
+        /* fully open to water (inactive) */
+        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+        return;
+    }
+    ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_2));
+    uint32_t duty=(uint32_t)lroundf((p/100.0f)*LEDC_DUTY_MAX);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2));
+}
+
+/* ===== Loop protection monitor ===== */
+static void loopprot_task(void *arg){
+    (void)arg;
+    TickType_t last = xTaskGetTickCount();
+    const TickType_t step = pdMS_TO_TICKS(50); /* 20 Hz toggle */
+    /* Новый надёжный детектор: считаем количество изменений входа за окно из 10 тактов (~500 мс).
+       Целая петля: вход меняется почти на каждом такте (>=8 из 10). Разрыв: вход почти постоянен (<=1 из 10). */
+    bool last_in = gpio_get_level((gpio_num_t)LOOP_IN_GPIO) ? true : false;
+    uint8_t win = 0, edges = 0;
+    for(;;){
+        bool drive = !g_loop_last_drive;
+        gpio_set_level((gpio_num_t)LOOP_OUT_GPIO, drive?1:0);
+        g_loop_last_drive = drive;
+        bool in = gpio_get_level((gpio_num_t)LOOP_IN_GPIO) ? true : false;
+        if (in != last_in) { edges++; last_in = in; }
+        if (++win >= 10){
+            if (edges <= 1){
+                if (g_loop_ok){
+                    g_loop_ok = false; ESP_LOGW(TAG, "LOOP: broken");
+                    /* notify clients about status change */
+                    #if CONFIG_BT_NIMBLE_ENABLED
+                    if (g_ble_connected && g_loop_stat_val_handle){
+                        uint8_t code = g_loopprot_enabled ? 2 : 0;
+                        struct os_mbuf* om = ble_hs_mbuf_from_flat(&code, 1);
+                        if (om) {
+                            int rc = ble_gatts_notify_custom(g_conn_handle, g_loop_stat_val_handle, om);
+                            if (rc != 0) ESP_LOGW(TAG, "LOOP notify(broken) rc=%d", rc);
+                        }
+                    }
+                    #endif
+                    if (g_loopprot_enabled){
+                        /* Force immediate STOP similar to 'SP' */
+                        g_system_running = false;
+                        fan_pwm_set_percent(0.0f);
+                        pump_pwm_set_percent(0.0f);
+                        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+                        gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
+                        gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
+                        g_pwm_fan_attached = false; g_pwm_pump_attached = false;
+                        uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+                        g_forced_stop_deadline_ms = now_ms + 1500u;
+                        g_pump_boost_active = false;
+                        if (g_purge_active) purge_stop();
+                    }
+                }
+            } else if (edges >= 8){
+                if (!g_loop_ok){
+                    g_loop_ok = true; ESP_LOGI(TAG, "LOOP: restored");
+                    /* notify clients about status change */
+                    #if CONFIG_BT_NIMBLE_ENABLED
+                    if (g_ble_connected && g_loop_stat_val_handle){
+                        uint8_t code = g_loopprot_enabled ? 1 : 0;
+                        struct os_mbuf* om = ble_hs_mbuf_from_flat(&code, 1);
+                        if (om) {
+                            int rc = ble_gatts_notify_custom(g_conn_handle, g_loop_stat_val_handle, om);
+                            if (rc != 0) ESP_LOGW(TAG, "LOOP notify(restored) rc=%d", rc);
+                        }
+                    }
+                    #endif
+                }
+            }
+            win = 0; edges = 0;
+        }
+        vTaskDelayUntil(&last, step);
+    }
+}
