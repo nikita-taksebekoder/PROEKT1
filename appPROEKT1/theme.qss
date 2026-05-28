@@ -1,0 +1,343 @@
+/* ==========================================================================
+   PROEKT1 — NEBULA CONTROL theme (dark + glass-morphism)
+   Палитра из дизайна Google Stitch:
+     background          #0f112b
+     surface-container   #1c1d38   (rgba 28,29,56)
+     surface-low         #181933
+     surface-lowest      #0a0b25
+     surface-high        #262843
+     surface-highest     #31324e
+     primary             #cdbdff   (светлый фиолетовый — текст/иконки)
+     primary-container   #7c4dff   (заливка кнопок — фиолетовый)
+     on-primary-container #fcf6ff
+     secondary           #8bd5ff   (голубой акцент)
+     on-surface          #e1e0ff
+     on-surface-variant  #cac3d8
+     outline             #948ea1
+     error               #ffb4ab
+   ========================================================================== */
+
+/* ---------- Окна ---------- */
+QMainWindow, QDialog {
+    background-color: #0f112b;
+    color: #e1e0ff;
+    font-family: "Inter", "Segoe UI", sans-serif;
+    font-size: 11pt;
+}
+
+/* Glass-карты (центральный виджет помечается objectName="glassCard") */
+QWidget#glassCard, QFrame#glassCard {
+    background-color: rgba(28, 29, 56, 200);
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 20px;
+}
+
+/* ---------- Метки ---------- */
+QLabel {
+    color: #e1e0ff;
+    background: transparent;
+}
+
+/* ---------- Базовые кнопки ---------- */
+QPushButton {
+    background-color: #7c4dff;
+    color: #fcf6ff;
+    border: none;
+    border-radius: 12px;
+    padding: 8px 18px;
+    font-size: 11pt;
+    font-weight: 600;
+    min-height: 32px;
+}
+QPushButton:hover {
+    background-color: #8c5fff;
+}
+QPushButton:pressed {
+    background-color: #6a3ee8;
+}
+QPushButton:disabled {
+    background-color: rgba(124, 77, 255, 60);
+    color: rgba(252, 246, 255, 110);
+}
+
+/* Вторичные/ghost-кнопки */
+QPushButton[variant="ghost"] {
+    background-color: rgba(255, 255, 255, 14);
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 26);
+}
+QPushButton[variant="ghost"]:hover {
+    background-color: rgba(255, 255, 255, 26);
+}
+
+/* Иконочные кнопки (settings, close) */
+QPushButton[variant="icon"] {
+    background-color: rgba(255, 255, 255, 14);
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 10px;
+    padding: 0;
+    min-width: 40px;
+    min-height: 40px;
+}
+QPushButton[variant="icon"]:hover {
+    background-color: rgba(124, 77, 255, 60);
+    border-color: #7c4dff;
+}
+
+/* ---------- ComboBox (BLE/USB, пресеты) ---------- */
+QComboBox {
+    background-color: rgba(24, 25, 51, 220);
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 10px;
+    padding: 6px 14px;
+    min-height: 32px;
+    font-size: 11pt;
+}
+QComboBox:hover {
+    border-color: #7c4dff;
+}
+QComboBox:focus {
+    border-color: #cdbdff;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 22px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #cdbdff;
+    margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1c1d38;
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 26);
+    border-radius: 8px;
+    selection-background-color: #7c4dff;
+    selection-color: #fcf6ff;
+    padding: 4px;
+    outline: none;
+}
+
+/* ---------- LineEdit / SpinBox ---------- */
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: rgba(24, 25, 51, 200);
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 10px;
+    padding: 6px 12px;
+    selection-background-color: #7c4dff;
+    selection-color: #fcf6ff;
+    font-size: 11pt;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #cdbdff;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background-color: rgba(255, 255, 255, 14);
+    border: none;
+    width: 18px;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #7c4dff;
+}
+
+/* ---------- Slider (яркость, задержки) ---------- */
+QSlider::groove:horizontal {
+    background: rgba(255, 255, 255, 26);
+    height: 4px;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background: #7c4dff;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #cdbdff;
+    border: 2px solid rgba(252, 246, 255, 200);
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QSlider::handle:horizontal:hover {
+    background: #e8deff;
+}
+
+/* ---------- CheckBox / RadioButton ---------- */
+QCheckBox, QRadioButton {
+    color: #cac3d8;
+    spacing: 8px;
+    font-size: 11pt;
+}
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid rgba(255, 255, 255, 50);
+    background: rgba(255, 255, 255, 14);
+}
+QCheckBox::indicator {
+    border-radius: 4px;
+}
+QRadioButton::indicator {
+    border-radius: 8px;
+}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {
+    border-color: #cdbdff;
+}
+QCheckBox::indicator:checked {
+    background: #7c4dff;
+    border-color: #7c4dff;
+    image: none;
+}
+QRadioButton::indicator:checked {
+    background: #cdbdff;
+    border: 4px solid #1c1d38;
+}
+
+/* ---------- GroupBox (секции настроек) ---------- */
+QGroupBox {
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 14px;
+    margin-top: 18px;
+    padding: 14px;
+    background-color: rgba(24, 25, 51, 140);
+    color: #e1e0ff;
+    font-size: 11pt;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 16px;
+    top: -2px;
+    padding: 0 8px;
+    color: #cdbdff;
+    font-weight: 700;
+    font-size: 9pt;
+    letter-spacing: 1px;
+}
+
+/* ---------- Меню / трей ---------- */
+QMenu {
+    background-color: #1c1d38;
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 26);
+    border-radius: 10px;
+    padding: 6px;
+}
+QMenu::item {
+    padding: 6px 18px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background-color: #7c4dff;
+    color: #fcf6ff;
+}
+QMenu::separator {
+    height: 1px;
+    background: rgba(255, 255, 255, 26);
+    margin: 4px 8px;
+}
+
+QToolTip {
+    background-color: #1c1d38;
+    color: #e1e0ff;
+    border: 1px solid rgba(124, 77, 255, 120);
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+
+/* ---------- Таблицы (LED custom, кривые) ---------- */
+QTableWidget {
+    background-color: rgba(10, 11, 37, 200);
+    color: #e1e0ff;
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 12px;
+    gridline-color: rgba(255, 255, 255, 18);
+    selection-background-color: #7c4dff;
+    selection-color: #fcf6ff;
+}
+QHeaderView::section {
+    background-color: #181933;
+    color: #cdbdff;
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 22);
+    padding: 6px;
+    font-weight: 700;
+    font-size: 9pt;
+    letter-spacing: 1px;
+}
+
+/* ---------- Скроллбары ---------- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: rgba(124, 77, 255, 120);
+    border-radius: 4px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #cdbdff;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+}
+QScrollBar::handle:horizontal {
+    background: rgba(124, 77, 255, 120);
+    border-radius: 4px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #cdbdff;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+/* ---------- Доп. семантические классы ---------- */
+QLabel[role="header"] {
+    color: #cdbdff;
+    font-size: 22pt;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+}
+QLabel[role="caption"] {
+    color: #cac3d8;
+    font-size: 9pt;
+    letter-spacing: 1px;
+    font-weight: 700;
+}
+
+/* Glass-плитка для значений (CPU/GPU/Вода/RPM) */
+QLabel[card="metric"] {
+    background-color: rgba(28, 29, 56, 180);
+    border: 1px solid rgba(255, 255, 255, 22);
+    border-radius: 16px;
+    padding: 12px;
+    color: #e1e0ff;
+    font-size: 18pt;
+    font-weight: 600;
+}
+QLabel[card="metric"][severity="ok"]   { color: #8bd5ff; }
+QLabel[card="metric"][severity="warn"] { color: #ffd166; }
+QLabel[card="metric"][severity="hot"]  { color: #ffb4ab; }
+
+QLabel[card="info"] {
+    background-color: rgba(28, 29, 56, 160);
+    border: 1px solid rgba(255, 255, 255, 18);
+    border-radius: 14px;
+    padding: 10px 14px;
+    color: #cac3d8;
+    font-size: 11pt;
+}

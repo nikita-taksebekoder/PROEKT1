@@ -1,0 +1,2 @@
+cd C:\Users\Forestsnow\Desktop\PROEKT1
+python PROEKT1.py

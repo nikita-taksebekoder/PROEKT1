@@ -13,8 +13,6 @@ static int s_u8g2_sw_i2c_sda = 21;
 static int s_u8g2_sw_i2c_delay_us = 10; /* extra slow for long wires/weak pullups */
 static int s_u8g2_reset_gpio = -1; /* optional */
 
-static const char *TAG = "u8g2_port";
-
 static void sw_i2c_delay(void) { esp_rom_delay_us(s_u8g2_sw_i2c_delay_us); }
 
 static void sw_i2c_set_scl(int level) {
@@ -69,7 +67,7 @@ uint8_t u8x8_byte_sw_i2c_espidf(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void
         sw_i2c_set_sda(0); sw_i2c_set_scl(1); sw_i2c_set_sda(1);
         break;
     case U8X8_MSG_BYTE_SET_DC:
-        // not used for I2C
+        // not used for SSD13xx I2C CAD path
         break;
     case U8X8_MSG_BYTE_SEND: {
         uint8_t *data = (uint8_t*)arg_ptr;

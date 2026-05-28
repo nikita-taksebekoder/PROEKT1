@@ -88,6 +88,9 @@ static esp_err_t led_strip_rmt_clear(led_strip_t *strip)
 static esp_err_t led_strip_rmt_del(led_strip_t *strip)
 {
     led_strip_rmt_obj *rmt_strip = __containerof(strip, led_strip_rmt_obj, base);
+    esp_err_t disable_err = rmt_disable(rmt_strip->rmt_chan);
+    ESP_RETURN_ON_FALSE(disable_err == ESP_OK || disable_err == ESP_ERR_INVALID_STATE,
+                        disable_err, TAG, "disable RMT channel before delete failed");
     ESP_RETURN_ON_ERROR(rmt_del_channel(rmt_strip->rmt_chan), TAG, "delete RMT channel failed");
     ESP_RETURN_ON_ERROR(rmt_del_encoder(rmt_strip->strip_encoder), TAG, "delete strip encoder failed");
     free(rmt_strip);

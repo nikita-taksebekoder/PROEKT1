@@ -1,4 +1,4 @@
-#include <string.h>
+﻿#include <string.h>
 #include <math.h>
 #include <assert.h>
 #include <stdbool.h>
@@ -17,6 +17,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
+#include "esp_private/periph_ctrl.h" /* periph_module_reset */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -137,6 +138,8 @@ static uint8_t own_addr_type;
 /* Ranges */
 #define TEMP_MIN_C           30.0f
 #define TEMP_MAX_C           110.0f
+/* Water temperature threshold above which err 6 is raised on the OLED status bar */
+#define WATER_TEMP_CRIT_C    50
 #define SPEED_MIN_PCT        0.0f
 #define SPEED_MAX_PCT        100.0f
 #define CURVE_POINTS_MAX     16
@@ -166,6 +169,7 @@ static uint8_t own_addr_type;
 
 /* Fan specifics */
 #define FAN_MIN_ON_PCT       30.0f
+#define PUMP_MIN_ON_PCT      30.0f
 #define OFF_BELOW_FIRST_PT
 
 /* Pump control mapping: desired vs. drive calibration
@@ -280,6 +284,9 @@ static uint32_t g_last_usb_ms = 0;
 static volatile uint32_t g_system_startup_ms = 0;
 /* Timestamp (ms) when a connection (BLE or USB) was established; used for post-connection grace */
 static volatile uint32_t g_conn_start_ms = 0;
+/* Timestamps (ms) of the moment BLE/USB first connected — used to show "ПОДКЛЮЧАЮ" animation */
+static volatile uint32_t g_ble_conn_since_ms = 0;
+static volatile uint32_t g_usb_conn_since_ms = 0;
 static uint16_t g_temp_val_handle = 0;
 static uint16_t g_fan_cfg_val_handle = 0;
 static uint16_t g_pump_cfg_val_handle = 0;
@@ -294,6 +301,8 @@ static volatile uint32_t g_last_temp_ms = 0;
 /* Water temperature (DS18B20) */
 static volatile int32_t g_water_temp_c = -1000;
 static volatile uint32_t g_last_water_ms = 0;
+static volatile bool g_err_ble_hw    = false;  /* err 2: BLE hardware/stack init failed */
+static volatile bool g_err_uart_hw   = false;  /* err 3: UART/USB hardware init failed */
 
 static curve_cfg_t g_fan;
 static curve_cfg_t g_pump;
@@ -309,6 +318,8 @@ static led_profile_t g_led_prof;
 static TaskHandle_t g_led_task = NULL;
 static volatile bool g_led_dirty = false;
 static volatile bool g_led_need_reinit = false; /* request safe reinit of RMT device */
+static volatile uint8_t g_led_refresh_errs = 0;
+static volatile uint8_t g_led_invalid_state_cnt = 0; /* consecutive INVALID_STATE errors */
 /* When true, keep LEDs on based on saved profile even without active PC connection */
 static volatile bool g_led_allow_disconnected = false;
 /* Synchronization for LED operations */
@@ -337,6 +348,8 @@ static volatile bool g_calibrating = false;
 static volatile bool g_purge_active = false;
 static volatile bool g_purge_cancel = false;
 static TaskHandle_t g_purge_task = NULL;
+/* Valve/pump ramp (short fill) indicator shown on OLED as "НАПОЛНЯЮ" */
+/* ramp indicator removed; use g_pump_boost_active for post-purge filling display */
 /* Remember that a purge sequence has completed; used to arm the next-start boost only after STOP */
 static volatile bool g_purge_completed_since_last_stop = false;
 /* Remember that a purge command was seen since last stop (covers manual cancel cases) */
@@ -348,6 +361,9 @@ static volatile uint32_t g_tach2_last_us = 0;
 
 /* System run/stop control */
 static volatile bool g_system_running = true; /* true = normal control; false = force stop (fans/pump off) */
+static volatile bool g_start_pending = false; /* one-shot: set by ST, consumed by control_task to check NVS boost */
+static volatile bool g_stop_pending  = false; /* one-shot: set by SP/break, consumed by control_task to kill HW */
+static volatile bool g_waiting_for_temps = false; /* explicit flag from app: waiting for target temps before spinning */
 
 /* Pump boost state (only after purge->stop -> next start) */
 static volatile bool g_pump_boost_armed = false;    /* armed by purge followed by stop */
@@ -363,6 +379,29 @@ static float g_pump_boost_target = 0.0f;            /* frozen target percent fro
 #define NVS_NS_LED   "led"
 #define NVS_KEY_LED  "prof_v1"
 
+/* Persisted boost pending flag (set after purge completion to survive power loss) */
+#define NVS_NS_SYS   "sys"
+#define NVS_KEY_BOOST "boost_pending"
+
+/* Helpers to set/take persisted boost flag */
+static void boost_flag_set_pending(bool v){
+    nvs_handle_t h; if (nvs_open(NVS_NS_SYS, NVS_READWRITE, &h) == ESP_OK){
+        (void)nvs_set_u8(h, NVS_KEY_BOOST, v ? 1 : 0);
+        (void)nvs_commit(h); nvs_close(h);
+    }
+}
+/* Atomically read and clear pending flag; returns true if it was set */
+static bool boost_flag_take_pending(void){
+    uint8_t val = 0; bool was = false; nvs_handle_t h;
+    if (nvs_open(NVS_NS_SYS, NVS_READWRITE, &h) == ESP_OK){
+        if (nvs_get_u8(h, NVS_KEY_BOOST, &val) == ESP_OK && val != 0){
+            was = true; (void)nvs_set_u8(h, NVS_KEY_BOOST, 0); (void)nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    return was;
+}
+
 /* Pump hours storage */
 #define NVS_NS_HOURS "hours"
 #define NVS_KEY_HOURS "v1"
@@ -370,6 +409,10 @@ static float g_pump_boost_target = 0.0f;            /* frozen target percent fro
 #define NVS_NS_CAL   "cal"
 #define NVS_KEY_RPM1 "rpm1_scale"
 #define NVS_KEY_RPM2 "rpm2_scale"
+/* OLED brightness persistence */
+#define NVS_NS_OLED  "oled"
+#define NVS_KEY_OLED_BR "bright"
+#define NVS_KEY_OLED_LANG "lang"    /* Display language: 0=RU, 1=EN */
 
 /* ===== Forward decls ===== */
 static void fan_pwm_init(void);
@@ -412,65 +455,165 @@ static bool g_pwm_valve_attached = false;
 /* ===== Loop protection (hose presence) ===== */
 static volatile bool g_loopprot_enabled = false;   /* configurable flag (persisted) */
 static volatile bool g_loop_ok = true;             /* current physical continuity state */
+static volatile bool g_was_running_before_loop_break = false; /* was system in РАБОТА when loop broke? */
 static volatile uint8_t g_loop_mismatch_ctr = 0;   /* debounce counters */
 static volatile uint8_t g_loop_match_ctr = 0;
 static volatile bool g_loop_last_drive = false;    /* last driven level on LOOP_OUT */
+static volatile uint32_t g_lp_restore_ms = 0;      /* tick when loop restored (0=not set); drives OLED countdown */
+#define LP_REARM_SECS 5                             /* countdown seconds after loop restoration */
 
-/* ===== OLED (SSD1312/SSD1306) minimal driver ===== */
+/* ===== OLED (SSD1312) driver ===== */
+/* SSD1312 controller: 128 segments × 64 COM.
+ * Display is mounted vertically (portrait): 64px wide, 128px tall.
+ * Framebuffer uses portrait coordinates; oled_flush rotates 90° to match controller. */
 #define OLED_SDA_GPIO      21
 #define OLED_SCL_GPIO      22
 #define OLED_ADDR          0x3C
+/* Portrait dimensions (what we draw in) */
 #define OLED_WIDTH         64
 #define OLED_HEIGHT        128
-#define OLED_PAGES         (OLED_HEIGHT/8)
+#define OLED_PAGES         (OLED_HEIGHT/8)  /* 16 pages in our framebuffer */
+/* Controller dimensions */
+#define OLED_HW_COLS       128
+#define OLED_HW_PAGES      8
 /* Optional hardware reset pin (tie your OLED RST to this GPIO). Set to -1 to disable. */
-#define OLED_RST_GPIO      23
+#define OLED_RST_GPIO      -1
 /* Runtime-adjustable params for diagnostics */
-static uint8_t g_oled_col_offset = (OLED_WIDTH==64)?0:0;
-static uint8_t g_oled_seg_remap = 1; /* 1 -> 0xA1, 0 -> 0xA0 */
-static uint8_t g_oled_com_scan = 1; /* 1 -> 0xC8, 0 -> 0xC0 */
+static uint8_t g_oled_seg_remap = 1; /* 1 -> 0xA1 (remapped) */
+static uint8_t g_oled_com_scan = 0; /* 0 -> 0xC0 (normal scan) */
+static uint8_t g_oled_display_offset = 0; /* 0..127 via 0xD3 */
+/* OLED display brightness (0=off .. 255=max), persisted in NVS */
+static volatile uint8_t g_oled_brightness = 0xCF; /* default contrast */
+/* Display language: 0=RU (Cyrillic), 1=EN (English), persisted in NVS */
+static volatile uint8_t g_display_lang = 0;
 
 static uint8_t g_oled_fb[OLED_WIDTH * OLED_PAGES]; /* page-major: page*WIDTH + x */
 static bool g_oled_inited = false;
 #ifdef HAVE_NEW_I2C
 static i2c_master_bus_handle_t g_i2c_bus = NULL;
-static i2c_master_dev_handle_t g_oled_dev = NULL;
+static i2c_master_dev_handle_t g_oled_devs[6] = {0};
+static uint8_t g_oled_dev_count = 0;
 #endif
 
 static esp_err_t oled_i2c_init(void){
 #ifdef HAVE_NEW_I2C
+    /* ---- I2C bus recovery (bit-bang SCL to release stuck SDA) ----
+     * After a WDT/crash the OLED controller may still be holding SDA LOW
+     * in the middle of an unfinished byte.  Toggling SCL 9+ times lets the
+     * slave finish its current bit and release SDA so we can issue STOP. */
+    {
+        gpio_config_t scl_cfg = {
+            .pin_bit_mask = (1ULL << OLED_SCL_GPIO),
+            .mode         = GPIO_MODE_OUTPUT_OD,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config_t sda_cfg = {
+            .pin_bit_mask = (1ULL << OLED_SDA_GPIO),
+            .mode         = GPIO_MODE_INPUT_OUTPUT_OD,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&scl_cfg);
+        gpio_config(&sda_cfg);
+        gpio_set_level((gpio_num_t)OLED_SCL_GPIO, 1);
+        gpio_set_level((gpio_num_t)OLED_SDA_GPIO, 1);
+        esp_rom_delay_us(5);
+        /* Clock out up to 9 bits to let slave finish any pending byte */
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level((gpio_num_t)OLED_SCL_GPIO, 0);
+            esp_rom_delay_us(5);
+            gpio_set_level((gpio_num_t)OLED_SCL_GPIO, 1);
+            esp_rom_delay_us(5);
+            if (gpio_get_level((gpio_num_t)OLED_SDA_GPIO)) break;  /* SDA released */
+        }
+        /* Generate STOP: SDA LOW→HIGH while SCL HIGH */
+        gpio_set_level((gpio_num_t)OLED_SDA_GPIO, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level((gpio_num_t)OLED_SCL_GPIO, 1);
+        esp_rom_delay_us(5);
+        gpio_set_level((gpio_num_t)OLED_SDA_GPIO, 1);
+        esp_rom_delay_us(5);
+        /* Release GPIOs so I2C driver can reclaim them */
+        gpio_reset_pin((gpio_num_t)OLED_SCL_GPIO);
+        gpio_reset_pin((gpio_num_t)OLED_SDA_GPIO);
+    }
+
     i2c_master_bus_config_t bus_cfg = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
         .sda_io_num = OLED_SDA_GPIO,
         .scl_io_num = OLED_SCL_GPIO,
         .glitch_ignore_cnt = 7,
-        .flags = { .enable_internal_pullup = true },
+        .flags = { .enable_internal_pullup = false },  /* external pull-ups required on SDA/SCL */
     };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &g_i2c_bus), TAG, "i2c bus init");
+    esp_err_t bus_err = i2c_new_master_bus(&bus_cfg, &g_i2c_bus);
+    if (bus_err != ESP_OK) {
+        ESP_LOGE(TAG, "OLED: i2c_new_master_bus FAILED: %s", esp_err_to_name(bus_err));
+        return bus_err;
+    }
+    ESP_LOGI(TAG, "OLED: I2C bus created OK (SDA=%d SCL=%d)", OLED_SDA_GPIO, OLED_SCL_GPIO);
+
+    /* Probe only the known OLED address (0x3C) with retry after bus reset */
+    g_oled_dev_count = 0;
+    const uint8_t oled_addr = 0x3C;
+    esp_err_t probe_err = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "OLED: probe retry %d/3 after bus reset", attempt + 1);
+            (void)i2c_master_bus_reset(g_i2c_bus);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        probe_err = i2c_master_probe(g_i2c_bus, oled_addr, pdMS_TO_TICKS(200));
+        if (probe_err == ESP_OK) break;
+    }
+    if (probe_err != ESP_OK){
+        ESP_LOGE(TAG, "OLED: no ACK from 0x%02X after 3 attempts (%s)", (unsigned)oled_addr, esp_err_to_name(probe_err));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OLED: I2C device found at 0x%02X", (unsigned)oled_addr);
+
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = 0x3C,
-        .scl_speed_hz = 100000,
+        .device_address = oled_addr,
+        .scl_speed_hz = 400000,  /* SSD1312 supports up to 400 kHz */
     };
-    esp_err_t r = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_oled_dev);
-    if (r != ESP_OK){
-        dev_cfg.device_address = 0x3D;
-        r = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &g_oled_dev);
-        if (r != ESP_OK) return r;
-        ESP_LOGW(TAG, "OLED: using addr 0x3D");
-    } else {
-        ESP_LOGI(TAG, "OLED: using addr 0x3C");
+    i2c_master_dev_handle_t h = NULL;
+    if (i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &h) != ESP_OK || h == NULL){
+        ESP_LOGE(TAG, "OLED: failed to add device 0x%02X", (unsigned)oled_addr);
+        return ESP_FAIL;
     }
+    g_oled_devs[g_oled_dev_count++] = h;
+    ESP_LOGI(TAG, "OLED: device 0x%02X registered (400 kHz)", (unsigned)oled_addr);
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
 
+static esp_err_t oled_send_cmd_idx(uint8_t idx, uint8_t cmd);
+
 static esp_err_t oled_send_cmd(uint8_t cmd){
 #ifdef HAVE_NEW_I2C
+    if (g_oled_dev_count == 0) return ESP_FAIL;
+    esp_err_t r = ESP_FAIL;
+    for (uint8_t i = 0; i < g_oled_dev_count; ++i){
+        esp_err_t t = oled_send_cmd_idx(i, cmd);
+        if (i == 0) r = t;
+    }
+    return r;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static esp_err_t oled_send_cmd_idx(uint8_t idx, uint8_t cmd){
+#ifdef HAVE_NEW_I2C
+    if (idx >= g_oled_dev_count) return ESP_ERR_INVALID_ARG;
     uint8_t buf[2] = {0x00, cmd};
-    return i2c_master_transmit(g_oled_dev, buf, sizeof(buf), pdMS_TO_TICKS(200));
+    return i2c_master_transmit(g_oled_devs[idx], buf, sizeof(buf), pdMS_TO_TICKS(200));
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
@@ -483,20 +626,30 @@ static inline void oled_apply_orientation(void){
     oled_send_cmd(g_oled_com_scan ? 0xC8 : 0xC0);
 }
 
+static inline void oled_apply_display_offset(void){
+    oled_send_cmd(0xD3);
+    oled_send_cmd((uint8_t)(g_oled_display_offset & 0x7F));
+}
+
 static esp_err_t oled_send_data(const uint8_t* data, size_t len){
-    const size_t CH = 16; esp_err_t r = ESP_OK;
+    #define OLED_I2C_CHUNK 128
+    esp_err_t r = ESP_OK;
 #ifdef HAVE_NEW_I2C
-    uint8_t buf[1+CH]; buf[0] = 0x40;
-    for (size_t off=0; off<len && r==ESP_OK; off+=CH){
-        size_t n = (len-off>CH)?CH:(len-off);
-        memcpy(&buf[1], data+off, n);
-        r = i2c_master_transmit(g_oled_dev, buf, 1+n, pdMS_TO_TICKS(200));
+    static uint8_t buf[1+OLED_I2C_CHUNK]; buf[0] = 0x40;  /* static: saves stack */
+    for (uint8_t d = 0; d < g_oled_dev_count; ++d){
+        for (size_t off=0; off<len && r==ESP_OK; off+=OLED_I2C_CHUNK){
+            size_t n = (len-off>OLED_I2C_CHUNK)?OLED_I2C_CHUNK:(len-off);
+            memcpy(&buf[1], data+off, n);
+            r = i2c_master_transmit(g_oled_devs[d], buf, 1+n, pdMS_TO_TICKS(200));
+        }
     }
     return r;
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
+
+static void oled_flush(void);
 
 static void __attribute__((unused)) oled_init(void){
     if (g_oled_inited) return;
@@ -515,34 +668,50 @@ static void __attribute__((unused)) oled_init(void){
     oled_send_cmd(0xE2);
     vTaskDelay(pdMS_TO_TICKS(10));
 #endif
-    /* Try a sequence compatible with SSD1306/SSD1312 and SH1107 64x128 */
+    /* SSD1312 128×64 init sequence */
     oled_send_cmd(0xAE); // display off
-    /* Addressing mode: Horizontal addressing for explicit 0x21/0x22 ranges */
-    oled_send_cmd(0x20); oled_send_cmd(0x00);
+    oled_send_cmd(0xD5); oled_send_cmd(0x80); // clock divide ratio & osc freq
+    oled_send_cmd(0xA8); oled_send_cmd(0x3F); // multiplex ratio = 63 (64 COM lines)
+    oled_send_cmd(0xD3); oled_send_cmd(0x00); // display offset = 0
+    oled_send_cmd(0x40); // display start line = 0
+    oled_send_cmd(0x8D); oled_send_cmd(0x14); // charge pump enable
+    oled_send_cmd(0xAD); oled_send_cmd(0x8B); // SSD1312 DC-DC on
+    oled_send_cmd(0x20); oled_send_cmd(0x02); // page addressing mode
     /* Orientation (runtime) */
     oled_apply_orientation();
-    /* Column and start line */
-    oled_send_cmd(0x00); // low col
-    oled_send_cmd(0x10); // high col
-    oled_send_cmd(0x40); // start line = 0
-    /* Contrast, multiplex, etc. (SSD1312 typical set A) */
-    oled_send_cmd(0x81); oled_send_cmd(0x7F); // mid contrast first
-    oled_send_cmd(0xA6); // normal display
-    oled_send_cmd(0xA8); oled_send_cmd((OLED_HEIGHT==128)?0x7F:0x3F); // multiplex by height
+    oled_send_cmd(0x00); // low column start = 0
+    oled_send_cmd(0x10); // high column start = 0
+    oled_send_cmd(0xDA); oled_send_cmd(0x12); // COM pins: alternative, no remap
+    /* Load persisted OLED brightness from NVS */
+    {
+        nvs_handle_t h; uint8_t br_val = 0xFF;
+        if (nvs_open(NVS_NS_OLED, NVS_READONLY, &h) == ESP_OK){
+            if (nvs_get_u8(h, NVS_KEY_OLED_BR, &br_val) == ESP_OK){
+                g_oled_brightness = br_val;
+                ESP_LOGI(TAG, "OLED: loaded brightness=%u from NVS", (unsigned)br_val);
+            }
+            uint8_t lang_val = 0;
+            if (nvs_get_u8(h, NVS_KEY_OLED_LANG, &lang_val) == ESP_OK){
+                g_display_lang = lang_val;
+                ESP_LOGI(TAG, "OLED: loaded lang=%u from NVS", (unsigned)lang_val);
+            }
+            nvs_close(h);
+        }
+    }
+    oled_send_cmd(0x81); oled_send_cmd(g_oled_brightness); // contrast
+    oled_send_cmd(0xD9); oled_send_cmd(0xF1); // pre-charge period
+    oled_send_cmd(0xDB); oled_send_cmd(0x40); // VCOMH deselect level
     oled_send_cmd(0xA4); // display from RAM
-    oled_send_cmd(0xD3); oled_send_cmd(0x00); // display offset 0
-    oled_send_cmd(0xD5); oled_send_cmd(0x80); // clock
-    oled_send_cmd(0xD9); oled_send_cmd(0x22); // pre-charge typical
-    oled_send_cmd(0xDA); oled_send_cmd(0x12); // COM pins config
-    oled_send_cmd(0xDB); oled_send_cmd(0x35); // VCOMH (typ. for SSD1312)
-    /* Enable power for panel */
-    oled_send_cmd(0x8D); oled_send_cmd(0x14); // SSD1306/1312 charge pump
-    oled_send_cmd(0xAD); oled_send_cmd(0x8B); // SSD1312 DC-DC on
+    oled_send_cmd(0xA6); // normal (not inverted)
+    oled_send_cmd(0x2E); // deactivate scroll
     oled_send_cmd(0xAF); // display on
     memset(g_oled_fb, 0x00, sizeof(g_oled_fb));
     g_oled_inited = true;
-    /* If first set didn't light up later, we'll bump contrast & precharge in test sweep */
-    ESP_LOGI(TAG, "OLED: init done");
+    /* If brightness was persisted as 0, turn display off immediately */
+    if (g_oled_brightness == 0) {
+        oled_send_cmd(0xAE); /* display off */
+    }
+    ESP_LOGI(TAG, "OLED: init done (brightness=%u)", (unsigned)g_oled_brightness);
 }
 
 static inline void oled_fb_clear(void){ memset(g_oled_fb, 0x00, sizeof(g_oled_fb)); }
@@ -552,8 +721,25 @@ static inline void oled_fb_set_pixel(int x, int y, bool on){
     if (on) g_oled_fb[idx] |= (uint8_t)(1u<<bit); else g_oled_fb[idx] &= (uint8_t)~(1u<<bit);
 }
 
-/* Minimal 5x7 ASCII font (subset) each glyph is 5 columns x 7 rows, LSB at top */
-typedef struct { char ch; uint8_t col[5]; } glyph5x7_t;
+static inline void oled_fb_fill_rect(int x, int y, int w, int h, bool on){
+    if (w <= 0 || h <= 0) return;
+    for (int yy = y; yy < y + h; ++yy){
+        for (int xx = x; xx < x + w; ++xx){
+            oled_fb_set_pixel(xx, yy, on);
+        }
+    }
+}
+
+static inline uint8_t bitrev8(uint8_t v){
+    v = (uint8_t)(((v & 0xF0u) >> 4) | ((v & 0x0Fu) << 4));
+    v = (uint8_t)(((v & 0xCCu) >> 2) | ((v & 0x33u) << 2));
+    v = (uint8_t)(((v & 0xAAu) >> 1) | ((v & 0x55u) << 1));
+    return v;
+}
+
+/* Minimal 5x7 font (ASCII + Cyrillic subset). Each glyph is 5 columns x 7 rows,
+ * column-major, bit 0 = top row. Field cp holds a Unicode codepoint (uint16_t). */
+typedef struct { uint16_t cp; uint8_t col[5]; } glyph5x7_t;
 static const glyph5x7_t k_font5x7[] = {
     {' ', {0x00,0x00,0x00,0x00,0x00}},
     {'-', {0x00,0x08,0x08,0x08,0x00}},
@@ -568,47 +754,189 @@ static const glyph5x7_t k_font5x7[] = {
     {'8', {0x36,0x49,0x49,0x49,0x36}},
     {'9', {0x06,0x49,0x49,0x29,0x1E}},
     {'A', {0x7E,0x11,0x11,0x11,0x7E}},
-    {'C', {0x3C,0x42,0x42,0x42,0x24}},
-    {'D', {0x7E,0x42,0x42,0x24,0x18}},
-    {'E', {0x7E,0x4A,0x4A,0x4A,0x42}},
-    {'O', {0x3C,0x42,0x42,0x42,0x3C}},
-    {'R', {0x7E,0x12,0x12,0x32,0x4C}},
-    {'T', {0x02,0x02,0x7E,0x02,0x02}},
-    {'V', {0x0E,0x30,0x40,0x30,0x0E}},
+    {'B', {0x7F,0x49,0x49,0x49,0x36}},
+    {'C', {0x3E,0x41,0x41,0x41,0x22}},
+    {'D', {0x7F,0x41,0x41,0x22,0x1C}},
+    {'E', {0x7F,0x49,0x49,0x49,0x41}},
+    {'F', {0x7F,0x09,0x09,0x09,0x01}},
+    {'G', {0x3E,0x41,0x49,0x49,0x7A}},
+    {'H', {0x7F,0x08,0x08,0x08,0x7F}},
+    {'I', {0x00,0x41,0x7F,0x41,0x00}},
+    {'L', {0x7F,0x40,0x40,0x40,0x40}},
+    {'M', {0x7F,0x02,0x0C,0x02,0x7F}},
+    {'N', {0x7F,0x04,0x08,0x10,0x7F}},
+    {'O', {0x3E,0x41,0x41,0x41,0x3E}},
+    {'P', {0x7F,0x09,0x09,0x09,0x06}},
+    {'R', {0x7F,0x09,0x19,0x29,0x46}},
+    {'S', {0x26,0x49,0x49,0x49,0x32}},
+    {'T', {0x01,0x01,0x7F,0x01,0x01}},
+    {'U', {0x3F,0x40,0x40,0x40,0x3F}},
+    {'V', {0x07,0x18,0x60,0x18,0x07}},
+    {'W', {0x3F,0x40,0x38,0x40,0x3F}},
+    {'Y', {0x07,0x08,0x70,0x08,0x07}},
+    {'a', {0x20,0x54,0x54,0x54,0x78}},
+    {'d', {0x38,0x44,0x44,0x48,0x7F}},
+    {'e', {0x38,0x54,0x54,0x54,0x18}},
+    {'g', {0x08,0x54,0x54,0x54,0x3C}},
+    {'i', {0x00,0x44,0x7D,0x40,0x00}},
+    {'l', {0x00,0x41,0x7F,0x40,0x00}},
+    {'n', {0x7C,0x04,0x04,0x04,0x78}},
+    {'o', {0x38,0x44,0x44,0x44,0x38}},
+    {'r', {0x7C,0x08,0x04,0x04,0x08}},
+    {'y', {0x0C,0x50,0x50,0x50,0x3C}},
+    {':', {0x00,0x36,0x36,0x00,0x00}},
+    {'.', {0x00,0x60,0x60,0x00,0x00}},
+    {'%', {0x62,0x64,0x08,0x13,0x23}},
+    {'!', {0x00,0x00,0x5F,0x00,0x00}},  /* exclamation mark */
+    /* ---- Cyrillic uppercase ---- */
+    {0x0410, {0x7E,0x11,0x11,0x11,0x7E}},  /* А (=A) */
+    {0x0411, {0x7F,0x45,0x45,0x45,0x38}},  /* Б — full 7px height: top bar + left vert + mid bar + bump */
+    {0x0412, {0x7F,0x49,0x49,0x49,0x36}},  /* В (=B) */
+    {0x0413, {0x3F,0x01,0x01,0x01,0x01}},  /* Г */
+    {0x0414, {0x61,0x3F,0x21,0x3F,0x61}},  /* Д — top bar + legs */
+    {0x0415, {0x7F,0x49,0x49,0x49,0x41}},  /* Е — left vert + top/mid/bottom bars */
+    {0x0416, {0x63,0x14,0x7F,0x14,0x63}},  /* Ж — center vert full, K-wings R2+R4, outer legs R0-1+R5-6 */
+    {0x0417, {0x00,0x49,0x49,0x49,0x7F}},  /* З */
+    {0x0418, {0x7F,0x10,0x08,0x04,0x7F}},  /* И — reversed-N diagonal */
+    {0x041A, {0x7F,0x08,0x14,0x22,0x41}},  /* К */
+    {0x041B, {0x78,0x04,0x02,0x01,0x7F}},  /* Л — diagonal left leg + right vertical */
+    {0x041D, {0x7F,0x08,0x08,0x08,0x7F}},  /* Н */
+    {0x041E, {0x3E,0x41,0x41,0x41,0x3E}},  /* О — full 7px height */
+    {0x041F, {0x7F,0x01,0x01,0x01,0x7F}},  /* П — full-height verticals R0-R6 */
+    {0x0420, {0x7F,0x09,0x09,0x09,0x06}},  /* Р (=P) */
+    {0x0421, {0x3E,0x41,0x41,0x41,0x22}},  /* С */
+    {0x0422, {0x01,0x01,0x7F,0x01,0x01}},  /* Т — full-height stem R0-R6 */
+    {0x0423, {0x43,0x4C,0x30,0x0C,0x03}},  /* У */
+    {0x0426, {0x7F,0x40,0x40,0x40,0xFF}},  /* Ц — full verticals R0-R6, bar at R6, tail at R7 (8-row exception) */
+    {0x0427, {0x0F,0x08,0x08,0x7F,0x00}},  /* Ч — left arm 1-col rows 0-3, bar at row 3, right vertical */
+    {0x0428, {0x7F,0x40,0x7F,0x40,0x7F}},  /* Ш */
+    {0x0429, {0x3F,0x20,0x3F,0x20,0x7F}},  /* Щ */
+    {0x042F, {0x66,0x19,0x09,0x09,0x7F}},  /* Я — правая вертикаль 0-6, чаша вверх-влево, ножка влево */
+    /* ---- Cyrillic lowercase ---- */
+    {0x0430, {0x20,0x54,0x54,0x54,0x78}},  /* а (=a) */
+    {0x0431, {0x00,0x3F,0x25,0x25,0x18}},  /* б */
+    {0x0432, {0x00,0x7E,0x4A,0x4A,0x30}},  /* в */
+    {0x0433, {0x7C,0x04,0x04,0x04,0x00}},  /* г */
+    {0x0437, {0x00,0x11,0x15,0x15,0x0A}},  /* з */
+    {0x0438, {0x3E,0x10,0x08,0x04,0x3E}},  /* и — reversed-N diagonal */
+    {0x043A, {0x7C,0x10,0x10,0x28,0x44}},  /* к */
+    {0x043E, {0x38,0x44,0x44,0x44,0x38}},  /* о (=o) */
+    {0x0440, {0x00,0x7E,0x12,0x12,0x0C}},  /* р */
+    {0x0442, {0x04,0x04,0x3C,0x04,0x04}},  /* т */
+    {0x0443, {0x0C,0x50,0x50,0x50,0x3C}},  /* у (=y) */
+    {0x0448, {0x3E,0x20,0x3E,0x20,0x3E}},  /* ш */
 };
 
-static const uint8_t* font5x7_get(char ch){
+/* Wide glyphs: variable columns (6–8) × 8 rows for letters needing extra width. */
+typedef struct { uint16_t cp; uint8_t ncols; uint8_t col[8]; } glyph_wide_t;
+static const glyph_wide_t k_font_wide[] = {
+    {0x041C, 6, {0x7F,0x02,0x04,0x04,0x02,0x7F}},        /* М — 6 cols */
+    {0x042B, 7, {0x7F,0x44,0x44,0x44,0x38,0x00,0x7F}},    /* Ы — 7 cols: Ь + gap + I */
+    {0x042E, 7, {0x7F,0x08,0x08,0x3E,0x41,0x41,0x3E}},    /* Ю — 7 cols: bar + 2-col connector + 4-col O */
+};
+/* Lookup wide glyph; returns col data pointer and sets *out_ncols. */
+static const uint8_t* font_wide_get(int cp, int* out_ncols){
+    size_t n = sizeof(k_font_wide)/sizeof(k_font_wide[0]);
+    for (size_t i=0;i<n;++i){
+        if ((int)k_font_wide[i].cp==cp){
+            if (out_ncols) *out_ncols = k_font_wide[i].ncols;
+            return k_font_wide[i].col;
+        }
+    }
+    return NULL;
+}
+/* Returns number of rendered columns for a codepoint */
+static inline int font_ncols(int cp){ int nc; return font_wide_get(cp,&nc) ? nc : 5; }
+
+static const uint8_t* font5x7_get(int cp){
     size_t n = sizeof(k_font5x7)/sizeof(k_font5x7[0]);
-    for (size_t i=0;i<n;++i){ if (k_font5x7[i].ch == ch) return k_font5x7[i].col; }
+    for (size_t i=0;i<n;++i){ if ((int)k_font5x7[i].cp == cp) return k_font5x7[i].col; }
     return k_font5x7[0].col; /* space */
 }
 
-static void oled_draw_char(int x, int y, char ch){
-    const uint8_t* g = font5x7_get(ch);
-    for (int dx=0; dx<5; ++dx){
+/* Decode one UTF-8 codepoint from *s, advance *s past it. Returns 0 at end. */
+static uint16_t utf8_next_cp(const char** s){
+    const unsigned char* p = (const unsigned char*)*s;
+    if (!*p) return 0;
+    uint16_t cp;
+    if (*p < 0x80) {
+        cp = *p++;
+    } else if ((*p & 0xE0) == 0xC0 && p[1]) {
+        cp = (uint16_t)(((unsigned)*p & 0x1Fu) << 6u) | ((unsigned)p[1] & 0x3Fu);
+        p += 2;
+    } else {
+        cp = (uint16_t)'?';
+        p++;
+        while (*p && (*p & 0xC0u) == 0x80u) p++;
+    }
+    *s = (const char*)p;
+    return cp;
+}
+
+/* Count display characters (codepoints) in a UTF-8 string */
+static int utf8_charlen(const char* s){
+    int n = 0;
+    const char* p = s;
+    while (utf8_next_cp(&p)) n++;
+    return n;
+}
+
+static void oled_draw_char(int x, int y, int cp){
+    int ncols = 5;
+    const uint8_t* g = font_wide_get(cp, &ncols);
+    if (!g) g = font5x7_get(cp);
+    for (int dx=0; dx<ncols; ++dx){
         uint8_t col = g[dx];
-        for (int dy=0; dy<7; ++dy){
-            bool on = (col >> dy) & 1u;
-            oled_fb_set_pixel(x+dx, y+dy, on);
+        for (int dy=0; dy<8; ++dy){
+            if ((col >> dy) & 1u)
+                oled_fb_set_pixel(x+dx, y+dy, true);
         }
     }
 }
 
-static void __attribute__((unused)) oled_draw_text(int x, int y, const char* s){
-    for (int i=0; s[i]; ++i){
-        oled_draw_char(x + i*6, y, s[i]);
+static void oled_draw_text(int x, int y, const char* s){
+    const char* p = s;
+    int xi = x;
+    uint16_t cp;
+    while ((cp = utf8_next_cp(&p)) != 0){
+        oled_draw_char(xi, y, (int)cp);
+        xi += font_ncols((int)cp) + 1;  /* glyph width + 1px gap */
     }
 }
 
+/* Returns pixel width of a UTF-8 string using the current font (variable-width aware) */
+static int text_px_width(const char* s){
+    const char* p = s; int w = 0; uint16_t cp;
+    while ((cp = utf8_next_cp(&p)) != 0)
+        w += font_ncols((int)cp) + 1;
+    return w;
+}
+
 static void oled_flush(void){
-    /* Explicit column/page range addressing (0x21/0x22) per page */
-    uint8_t x0 = g_oled_col_offset;
-    uint8_t x1 = (uint8_t)(g_oled_col_offset + OLED_WIDTH - 1);
-    for (int page=0; page<OLED_PAGES; ++page){
-        oled_send_cmd(0x21); oled_send_cmd(x0); oled_send_cmd(x1);   /* Column range */
-        oled_send_cmd(0x22); oled_send_cmd((uint8_t)page); oled_send_cmd((uint8_t)page); /* Page range */
-        const uint8_t* row = &g_oled_fb[page*OLED_WIDTH];
-        (void)oled_send_data(row, OLED_WIDTH);
+    /* Rotate portrait framebuffer (64w×128h) → SSD1312 hardware (128 cols × 8 pages).
+     * Portrait pixel (px, py) → controller col=py, row=(63-px).
+     * Controller page = row/8, bit = row%8. */
+    uint8_t tx[OLED_HW_COLS];
+    for (int hp = 0; hp < OLED_HW_PAGES; ++hp){
+        oled_send_cmd((uint8_t)(0xB0 | hp));      /* set page */
+        oled_send_cmd(0x00);                       /* lower col = 0 */
+        oled_send_cmd(0x10);                       /* upper col = 0 */
+        for (int c = 0; c < OLED_HW_COLS; ++c){
+            uint8_t byte = 0;
+            for (int b = 0; b < 8; ++b){
+                /* controller row = hp*8 + b → portrait px = 63 - (hp*8+b) */
+                int px = 63 - (hp * 8 + b);
+                int py = c;  /* controller col = portrait y */
+                if (px >= 0 && px < OLED_WIDTH && py >= 0 && py < OLED_HEIGHT){
+                    int fb_page = py >> 3;
+                    int fb_bit  = py & 7;
+                    if (g_oled_fb[fb_page * OLED_WIDTH + px] & (1u << fb_bit))
+                        byte |= (uint8_t)(1u << b);
+                }
+            }
+            tx[c] = byte;
+        }
+        (void)oled_send_data(tx, OLED_HW_COLS);
     }
 }
 
@@ -627,6 +955,10 @@ static inline uint8_t clampu8(int v){ if(v<0) return 0; if(v>255) return 255; re
 
 static float fan_apply_min_floor(float s){
     if (s > 0.0f && s < FAN_MIN_ON_PCT) return FAN_MIN_ON_PCT;
+    return s;
+}
+static float pump_apply_min_floor(float s){
+    if (s > 0.0f && s < PUMP_MIN_ON_PCT) return PUMP_MIN_ON_PCT;
     return s;
 }
 
@@ -659,7 +991,7 @@ static float eval_curve(const curve_cfg_t *cfg, float tC, bool for_fan){
         s=catmull_rom(pm0->s,p1->s,p2->s,pm3->s,u);
     }
     s=clampf(s,0,100);
-    return for_fan?fan_apply_min_floor(s):s;
+    return for_fan ? fan_apply_min_floor(s) : pump_apply_min_floor(s);
 }
 
 static float lp_update(float prev, float target, float tau_sec, float dt_sec){
@@ -729,16 +1061,63 @@ static void pump_save_to_nvs(void){
 /* ===== LED low-level ===== */
 static inline uint8_t scale_bright(uint8_t v, uint8_t br){ return (uint8_t)((uint16_t)v*(uint16_t)br/255U); }
 
+#define LED_REFRESH_ERR_REINIT 3
+#define LED_FRAME_DUPLICATE   0
+#define LED_REFRESH_MIN_MS    17
+static inline esp_err_t led_refresh_safe(void){
+    if (!g_led_strip) return ESP_ERR_INVALID_STATE;
+    static uint32_t last_ms = 0;
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (last_ms != 0 && (now_ms - last_ms) < LED_REFRESH_MIN_MS) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = led_strip_refresh(g_led_strip);
+    if (err == ESP_OK) {
+        last_ms = now_ms;
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        err = led_strip_refresh(g_led_strip);
+        if (err == ESP_OK) {
+            last_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        }
+    }
+    return err;
+}
+static inline void led_note_refresh_result(esp_err_t err){
+    if (err == ESP_OK) {
+        g_led_refresh_errs = 0;
+        g_led_invalid_state_cnt = 0;
+        return;
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* RMT channel stuck (not in init state).  A single occurrence can be
+         * transient (TX still in progress), but after several consecutive
+         * failures the channel is permanently jammed and the only recovery
+         * is to delete + re-create the RMT device. */
+        if (g_led_invalid_state_cnt < 255) g_led_invalid_state_cnt++;
+        if (g_led_invalid_state_cnt >= 10) {
+            ESP_LOGW(TAG, "LED RMT: %u consecutive INVALID_STATE – scheduling reinit",
+                     (unsigned)g_led_invalid_state_cnt);
+            g_led_need_reinit = true;
+            g_led_invalid_state_cnt = 0;
+        }
+        return;
+    }
+    if (g_led_refresh_errs < 255) g_led_refresh_errs++;
+    /* Do not auto-reinit to avoid visible flashes; keep running */
+}
+
 static void leds_apply_rgb(uint8_t r,uint8_t g,uint8_t b){
     if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
     if (!g_led_strip) { ESP_LOGW(TAG, "LED strip not initialized"); if (g_led_mtx) xSemaphoreGive(g_led_mtx); return; }
     if (g_led_need_reinit) { if (g_led_mtx) xSemaphoreGive(g_led_mtx); return; }
     for(int i=0;i<LED_STRIP_LENGTH;++i) (void)led_strip_set_pixel(g_led_strip,i,r,g,b);
-    esp_err_t err = led_strip_refresh(g_led_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "led_strip_refresh failed: %d (schedule safe reinit)", err);
-        g_led_need_reinit = true;
+    esp_err_t err = led_refresh_safe();
+    if (err != ESP_OK && g_led_invalid_state_cnt <= 1) {
+        ESP_LOGE(TAG, "led_strip_refresh failed: %s", esp_err_to_name(err));
     }
+    led_note_refresh_result(err);
     if (g_led_mtx) xSemaphoreGive(g_led_mtx);
 }
 
@@ -760,11 +1139,11 @@ static void leds_apply_custom(void){
         uint8_t b = scale_bright(b_raw, g_led_prof.brightness);
         (void)led_strip_set_pixel(g_led_strip,i,r,g,b);
     }
-    esp_err_t err = led_strip_refresh(g_led_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "led_strip_refresh(custom) failed: %d (schedule safe reinit)", err);
-        g_led_need_reinit = true;
+    esp_err_t err = led_refresh_safe();
+    if (err != ESP_OK && g_led_invalid_state_cnt <= 1) {
+        ESP_LOGE(TAG, "led_strip_refresh(custom) failed: %s", esp_err_to_name(err));
     }
+    led_note_refresh_result(err);
     if (g_led_mtx) xSemaphoreGive(g_led_mtx);
 }
 
@@ -774,12 +1153,14 @@ static bool leds_off(void){
     if (!g_led_strip) { if (g_led_mtx) xSemaphoreGive(g_led_mtx); return false; }
     if (g_led_need_reinit) { if (g_led_mtx) xSemaphoreGive(g_led_mtx); return false; }
     (void)led_strip_clear(g_led_strip);
-    esp_err_t err = led_strip_refresh(g_led_strip);
+    esp_err_t err = led_refresh_safe();
     if (err == ESP_OK) {
         ok = true;
     } else {
-        ESP_LOGE(TAG, "led_strip_refresh(off) failed: %d (schedule safe reinit)", err);
-        g_led_need_reinit = true;
+        if (g_led_invalid_state_cnt <= 1) {
+            ESP_LOGE(TAG, "led_strip_refresh(off) failed: %s", esp_err_to_name(err));
+        }
+        led_note_refresh_result(err);
     }
     if (g_led_mtx) xSemaphoreGive(g_led_mtx);
     return ok;
@@ -798,7 +1179,12 @@ static void leds_init(void){
     led_strip_rmt_config_t rmt_config={
         .clk_src=RMT_CLK_SRC_DEFAULT,
         .resolution_hz=LED_STRIP_RES_HZ,
-        .mem_block_symbols=0,
+        /* Use all 512 RMT symbols (ESP32 has 8×64=512 total, we use 1 channel).
+         * 20 LEDs need 480+1=481 symbols. With 512 the encoder fills
+         * everything upfront before TX starts — zero ISR refills,
+         * zero risk of BLE/I2C ISR delays causing false WS2812 resets
+         * and green glitches on the tail end of the strip. */
+        .mem_block_symbols=512,
         /* On ESP32 (IDF target), DMA is not supported by RMT WS2812 driver; use PIO to avoid boot errors */
         .flags.with_dma=false,
     };
@@ -839,11 +1225,12 @@ static void led_prof_load(void){
     led_prof_set_defaults();
     nvs_handle_t h; size_t len=sizeof(g_led_prof);
     if (nvs_open(NVS_NS_LED,NVS_READONLY,&h)==ESP_OK){
+        if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
         if (nvs_get_blob(h,NVS_KEY_LED,&g_led_prof,&len)==ESP_OK && len==sizeof(g_led_prof) && g_led_prof.version == 1){
             if (g_led_prof.mode == LED_MODE_CUSTOM){
                 ESP_LOGI(TAG,"LED profile loaded: mode=%u(custom) br=%u (first RGB=%u,%u,%u)",
                          g_led_prof.mode, g_led_prof.brightness,
-                         g_led_prof.custom_colors[0], g_led_prof.custom_colors[1], g_led_prof.custom_colors[2]);
+                         (unsigned)g_led_prof.custom_colors[0][0], (unsigned)g_led_prof.custom_colors[0][1], (unsigned)g_led_prof.custom_colors[0][2]);
             } else if (g_led_prof.mode == LED_MODE_GRADIENT_ANIM){
                 ESP_LOGI(TAG,"LED profile loaded: mode=%u(gradient) start=(%u,%u,%u) end=(%u,%u,%u) speed=%u br=%u",
                          g_led_prof.mode,
@@ -857,6 +1244,7 @@ static void led_prof_load(void){
             loaded = true;
         }
         nvs_close(h);
+        if (g_led_mtx) xSemaphoreGive(g_led_mtx);
     }
     if (loaded) {
         g_led_dirty = true; /* trigger immediate apply */
@@ -908,60 +1296,77 @@ static void pump_pwm_set_percent(float pct){
     /* Desired mapping: 100%->5V, 30%->2V, 0%->0V; Drive mapping uses calibrated points for better match */
     float s = clampf(pct, 0.0f, 100.0f);
     if (s <= 0.0f) {
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+        if (g_pwm_pump_attached) ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
         return;
     }
-    uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-    if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-        return;
+    /* Skip if channel not attached (SP detached it; control_task will re-attach) */
+    if (!g_pwm_pump_attached) return;
+    /* Во время продувки forced-stop НЕ блокирует помпу */
+    if (!g_purge_active){
+        uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+        if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
+            ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            return;
+        }
     }
     float v_des = pump_target_voltage_from_percent(s);
     float v_drv = pump_drive_voltage_from_percent(s);
     float duty_frac = clampf(v_drv / PUMP_SUPPLY_V, 0.0f, 1.0f);
-    ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1));
+    esp_err_t err;
+    err = ledc_timer_resume(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_1);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "PUMP: timer_resume err=%s", esp_err_to_name(err)); return; }
     uint32_t duty = (uint32_t)lroundf(duty_frac * (float)LEDC_DUTY_MAX);
+    if (duty > LEDC_DUTY_MAX) duty = LEDC_DUTY_MAX;
     ESP_LOGD(TAG, "PUMP PWM: s=%.1f%% -> desired=%.2fV, drive=%.3fV, duty=%lu/%u (%.1f%%), f=%u Hz",
              s, (double)v_des, (double)v_drv, (unsigned long)duty, (unsigned)LEDC_DUTY_MAX, duty_frac*100.0f, (unsigned)LEDC_PUMP_FREQ_HZ);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
+    err = ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, duty);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "PUMP: set_duty err=%s", esp_err_to_name(err)); return; }
+    err = ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "PUMP: update_duty err=%s", esp_err_to_name(err)); }
 }
 
 /* ===== Fan PWM ===== */
-static void fan_pwm_init(void){
-    /* Ensure PWM GPIOs have internal pulldowns as a fallback when lines are floating during early boot */
-    /* FAN PWM */
-    gpio_set_pull_mode((gpio_num_t)FAN_PWM_GPIO, GPIO_PULLDOWN_ONLY);
-#if defined(GPIO_PULLDOWN_ENABLE) || defined(gpio_pulldown_en)
-    gpio_pulldown_en((gpio_num_t)FAN_PWM_GPIO);
-#endif
-    /* PUMP PWM */
-    /* Ensure pump GPIO has an internal pulldown as a fallback when user only has a high-value resistor (e.g. 100k) */
-    gpio_set_pull_mode((gpio_num_t)PUMP_PWM_GPIO, GPIO_PULLDOWN_ONLY);
-#if defined(GPIO_PULLDOWN_ENABLE) || defined(gpio_pulldown_en)
-    /* also try legacy API if available */
-    gpio_pulldown_en((gpio_num_t)PUMP_PWM_GPIO);
-#endif
-    /* Configure separate timers: FAN on TIMER_0 (high freq), PUMP on TIMER_1 (lower freq) */
-    ledc_timer_config_t t_fan={ .speed_mode=LEDC_LOW_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
-                                .timer_num=LEDC_TIMER_0, .freq_hz=LEDC_FAN_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
-    ESP_ERROR_CHECK(ledc_timer_config(&t_fan));
-    ledc_timer_config_t t_pump={ .speed_mode=LEDC_LOW_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
-                                 .timer_num=LEDC_TIMER_1, .freq_hz=LEDC_PUMP_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
-    ESP_ERROR_CHECK(ledc_timer_config(&t_pump));
-    ledc_channel_config_t c_fan={ .gpio_num=FAN_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                  .channel=LEDC_CHANNEL_0, .intr_type=LEDC_INTR_DISABLE,
-                                  .timer_sel=LEDC_TIMER_0, .duty=0, .hpoint=0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&c_fan));
-    ledc_channel_config_t c_pump={ .gpio_num=PUMP_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                   .channel=LEDC_CHANNEL_1, .intr_type=LEDC_INTR_DISABLE,
-                                   .timer_sel=LEDC_TIMER_1, .duty=0, .hpoint=0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&c_pump));
-    ESP_ERROR_CHECK(ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0));
-    ESP_ERROR_CHECK(ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,0));
-    /* Mark channels as attached initially */
+/* Safe re-attach: fully reconfigure the LEDC timer+channel from scratch.
+ * Using LEDC_HIGH_SPEED_MODE which applies updates IMMEDIATELY without
+ * the para_up busy-wait that caused WDT hangs / boot-loops on LOW_SPEED_MODE. */
+static void safe_ledc_attach_fan(void){
+    ledc_timer_config_t t={ .speed_mode=LEDC_HIGH_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
+                            .timer_num=LEDC_TIMER_0, .freq_hz=LEDC_FAN_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
+    esp_err_t err = ledc_timer_config(&t);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FAN: timer_config err=%s", esp_err_to_name(err)); return; }
+    ledc_channel_config_t c={ .gpio_num=FAN_PWM_GPIO, .speed_mode=LEDC_HIGH_SPEED_MODE,
+                              .channel=LEDC_CHANNEL_0, .intr_type=LEDC_INTR_DISABLE,
+                              .timer_sel=LEDC_TIMER_0, .duty=0, .hpoint=0 };
+    err = ledc_channel_config(&c);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FAN: channel_config err=%s", esp_err_to_name(err)); return; }
+    (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, 0);
     g_pwm_fan_attached = true;
+}
+static void safe_ledc_attach_pump(void){
+    ledc_timer_config_t t={ .speed_mode=LEDC_HIGH_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
+                            .timer_num=LEDC_TIMER_1, .freq_hz=LEDC_PUMP_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
+    esp_err_t err = ledc_timer_config(&t);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "PUMP: timer_config err=%s", esp_err_to_name(err)); return; }
+    ledc_channel_config_t c={ .gpio_num=PUMP_PWM_GPIO, .speed_mode=LEDC_HIGH_SPEED_MODE,
+                              .channel=LEDC_CHANNEL_1, .intr_type=LEDC_INTR_DISABLE,
+                              .timer_sel=LEDC_TIMER_1, .duty=0, .hpoint=0 };
+    err = ledc_channel_config(&c);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "PUMP: channel_config err=%s", esp_err_to_name(err)); return; }
+    (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
     g_pwm_pump_attached = true;
+}
+
+static void fan_pwm_init(void){
+    /* GPIOs are already pinned LOW from early app_main, but reinforce pull-down
+       before LEDC takes over the pin mux. */
+    gpio_set_pull_mode((gpio_num_t)FAN_PWM_GPIO, GPIO_PULLDOWN_ONLY);
+    gpio_pulldown_en((gpio_num_t)FAN_PWM_GPIO);
+    gpio_set_pull_mode((gpio_num_t)PUMP_PWM_GPIO, GPIO_PULLDOWN_ONLY);
+    gpio_pulldown_en((gpio_num_t)PUMP_PWM_GPIO);
+    /* safe_ledc_attach_* handles full timer+channel config internally;
+     * no separate ledc_timer_config needed here (avoids triple-config race). */
+    safe_ledc_attach_fan();
+    safe_ledc_attach_pump();
 }
 
 static void fan_pwm_set_percent(float pct){
@@ -971,20 +1376,30 @@ static void fan_pwm_set_percent(float pct){
 #endif
     uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
-        ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0);
+        if (g_pwm_fan_attached) ledc_stop(LEDC_HIGH_SPEED_MODE,LEDC_CHANNEL_0,0);
         return;
     }
-    if (p<=0.0f){ ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0); return; }
-    ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE,LEDC_TIMER_0));
+    if (p<=0.0f){ if (g_pwm_fan_attached) ledc_stop(LEDC_HIGH_SPEED_MODE,LEDC_CHANNEL_0,0); return; }
+    /* Skip if channel not attached (SP detached it; control_task will re-attach) */
+    if (!g_pwm_fan_attached) return;
+    esp_err_t err;
+    err = ledc_timer_resume(LEDC_HIGH_SPEED_MODE,LEDC_TIMER_0);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "FAN: timer_resume err=%s", esp_err_to_name(err)); return; }
     uint32_t duty=(uint32_t)lroundf((p/100.0f)*LEDC_DUTY_MAX);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0));
+    if (duty > LEDC_DUTY_MAX) duty = LEDC_DUTY_MAX;
+    err = ledc_set_duty(LEDC_HIGH_SPEED_MODE,LEDC_CHANNEL_0,duty);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "FAN: set_duty err=%s", esp_err_to_name(err)); return; }
+    err = ledc_update_duty(LEDC_HIGH_SPEED_MODE,LEDC_CHANNEL_0);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "FAN: update_duty err=%s", esp_err_to_name(err)); }
 }
 
 /* Ensure LEDC timers/channels are initialized exactly once */
 static void ensure_ledc_init_once(void){
     static bool inited = false;
     if (!inited){
+        /* Hardware-reset LEDC peripheral to clear any stuck state
+         * (e.g. stale para_up bits surviving SW_CPU_RESET after WDT) */
+        periph_module_reset(PERIPH_LEDC_MODULE);
         fan_pwm_init();
         inited = true;
     }
@@ -1010,14 +1425,15 @@ static bool apply_lx_bytes(const uint8_t* buf, uint16_t total){
     uint8_t ver=buf[2]; if (ver!=1) return false;
     uint8_t mode=buf[3], brightness=buf[4];
     if (!g_led_strip) leds_init();
+    if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
     g_led_prof.version=1;
     if (mode == LED_MODE_CUSTOM) {
-        if (total < 5 + sizeof(g_led_prof.custom_colors)) return false;
+        if (total < 5 + sizeof(g_led_prof.custom_colors)) { if (g_led_mtx) xSemaphoreGive(g_led_mtx); return false; }
         g_led_prof.mode = mode;
         g_led_prof.brightness = brightness;
         memcpy(g_led_prof.custom_colors, &buf[5], sizeof(g_led_prof.custom_colors));
     } else if (mode == LED_MODE_GRADIENT_ANIM) {
-        if (total < 12) return false;
+        if (total < 12) { if (g_led_mtx) xSemaphoreGive(g_led_mtx); return false; }
         g_led_prof.mode = mode;
         g_led_prof.brightness = brightness;
         g_led_prof.start_r = buf[5]; g_led_prof.start_g = buf[6]; g_led_prof.start_b = buf[7];
@@ -1035,6 +1451,7 @@ static bool apply_lx_bytes(const uint8_t* buf, uint16_t total){
         g_led_prof.brightness = brightness;
     }
     led_prof_save(); g_led_dirty=true;
+    if (g_led_mtx) xSemaphoreGive(g_led_mtx);
     /* Apply asynchronously in led_task to avoid races with RMT driver */
     if (mode == LED_MODE_CUSTOM) {
         ESP_LOGI(TAG,"LED profile set: mode=%u (custom) br=%u", g_led_prof.mode, g_led_prof.brightness);
@@ -1201,6 +1618,16 @@ static void uart_send_hr(void){
     buf[0] = 'H';
     buf[1] = 'R';
     memcpy(&buf[2], &g_hours, sizeof(g_hours));
+    (void)uart_write_bytes(UART_PORT, (const char*)buf, sizeof(buf));
+}
+
+/* NEW: UART helper to send Loop Status 'LS' + <uint8_t code>
+ * code: 0=disabled, 1=ok(was pause), 2=broken, 3=restored(was running) */
+static void uart_send_ls(uint8_t code){
+    uint8_t buf[3];
+    buf[0] = 'L';
+    buf[1] = 'S';
+    buf[2] = code;
     (void)uart_write_bytes(UART_PORT, (const char*)buf, sizeof(buf));
 }
 
@@ -1400,12 +1827,35 @@ static void tach_sample_and_publish(uint32_t interval_ms){
 
     /* Флаги «авария» проверяем по калиброванным значениям */
     uint32_t flags = 0;
+    /* Таймеры залипания: храним момент начала стала (0 = нет стала) */
+    static uint32_t f1_stall_since = 0;
+    static uint32_t f2_stall_since = 0;
     if (g_purge_active) {
         flags |= RPM_FLAG_PURGE; /* suppress faults during purge */
+        f1_stall_since = 0;
+        f2_stall_since = 0;
+    } else if (g_waiting_for_temps) {
+        /* Suppress stall detection while waiting for target temperatures.
+         * PWM is 0, RPM is 0 — this is expected, not a fault. */
+        f1_stall_since = 0;
+        f2_stall_since = 0;
     } else {
-        /* Raise fault flags only in WORK mode */
-        if (g_system_running && (g_ble_connected || g_usb_connected) && !startup_grace_period && g_fan_last_appl > 1.0f && g_rpm1 < RPM_FAULT_MIN) flags |= RPM_FLAG_F1;
-        if (g_system_running && (g_ble_connected || g_usb_connected) && !startup_grace_period && g_pump_last_appl > 1.0f && g_rpm2 < RPM_FAULT_MIN) flags |= RPM_FLAG_F2;
+        bool f1_cond = g_system_running && (g_ble_connected || g_usb_connected)
+                       && !startup_grace_period
+                       && g_fan_last_appl > 1.0f && g_rpm1 < RPM_FAULT_MIN;
+        bool f2_cond = g_system_running && (g_ble_connected || g_usb_connected)
+                       && !startup_grace_period
+                       && g_pump_last_appl > 1.0f && g_rpm2 < RPM_FAULT_MIN;
+
+        /* Запускаем таймер при начале стала, сбрасываем при выходе */
+        if (f1_cond) { if (f1_stall_since == 0) f1_stall_since = now; }
+        else           { f1_stall_since = 0; }
+        if (f2_cond) { if (f2_stall_since == 0) f2_stall_since = now; }
+        else           { f2_stall_since = 0; }
+
+        /* Авария — только если стал длится >= 45 секунд */
+        if (f1_stall_since != 0 && (now - f1_stall_since) >= 45000u) flags |= RPM_FLAG_F1;
+        if (f2_stall_since != 0 && (now - f2_stall_since) >= 45000u) flags |= RPM_FLAG_F2;
     }
     g_rpm_flags = flags;
 
@@ -1425,15 +1875,15 @@ static void tach_sample_and_publish(uint32_t interval_ms){
 #if CONFIG_BT_NIMBLE_ENABLED
 static int fan_cfg_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
     if (ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
-    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>256) total=256;
-    uint8_t buf[256]; os_mbuf_copydata(ctxt->om,0,total,buf);
+    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>64) total=64;
+    uint8_t buf[64]; os_mbuf_copydata(ctxt->om,0,total,buf);
     (void)apply_fc_bytes(buf,total); return 0;
 }
 
 static int pump_cfg_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
     if (ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
-    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>256) total=256;
-    uint8_t buf[256]; os_mbuf_copydata(ctxt->om,0,total,buf);
+    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>64) total=64;
+    uint8_t buf[64]; os_mbuf_copydata(ctxt->om,0,total,buf);
     (void)apply_pc_bytes(buf,total); return 0;
 }
 
@@ -1456,18 +1906,22 @@ static int __attribute__((unused)) cal_write_cb(uint16_t, uint16_t, struct ble_g
 
 static int led_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *){
     if (ctxt->op!=BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
-    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>256) total=256;
-    uint8_t buf[256]; os_mbuf_copydata(ctxt->om,0,total,buf);
+    uint16_t total=OS_MBUF_PKTLEN(ctxt->om); if (total>64) total=64;
+    uint8_t buf[64]; os_mbuf_copydata(ctxt->om,0,total,buf);
     if (total>=2 && buf[0]=='L' && buf[1]=='X'){ (void)apply_lx_bytes(buf,total); return 0; }
     if (!g_led_strip) leds_init();
     if (total==4){
+        if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
         g_led_prof.version=1; g_led_prof.mode=LED_MODE_SOLID;
         g_led_prof.r=buf[0]; g_led_prof.g=buf[1]; g_led_prof.b=buf[2]; g_led_prof.brightness=buf[3];
         led_prof_save(); g_led_dirty=true;
+        if (g_led_mtx) xSemaphoreGive(g_led_mtx);
     } else if (total==3){
+        if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
         g_led_prof.version=1; g_led_prof.mode=LED_MODE_SOLID;
         g_led_prof.r=buf[0]; g_led_prof.g=buf[1]; g_led_prof.b=buf[2];
         led_prof_save(); g_led_dirty=true;
+        if (g_led_mtx) xSemaphoreGive(g_led_mtx);
     }
     return 0;
 }
@@ -1488,58 +1942,23 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
         g_purge_seen_since_last_stop = true; /* track that purge command was issued */
         purge_start();
     } else if (cmd[0]=='S' && cmd[1]=='T') {
-        /* 'ST' -> start normal operation */
+        /* 'ST' -> start normal operation.
+         * IMPORTANT: heavy LEDC re-attach and boost start are deferred to control_task
+         * to avoid stack overflow / para_up hang in the NimBLE host task context. */
         if (g_loopprot_enabled && !g_loop_ok){ ESP_LOGW(TAG, "LOOP: broken, start denied"); return 0; }
-        g_system_running = true;
         g_forced_stop_deadline_ms = 0; /* clear guard */
-        /* Re-attach channels if needed (mirrors UART handler) */
-        if (!g_pwm_fan_attached){
-            ledc_channel_config_t c_fan={ .gpio_num=FAN_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                          .channel=LEDC_CHANNEL_0, .intr_type=LEDC_INTR_DISABLE,
-                                          .timer_sel=LEDC_TIMER_0, .duty=0, .hpoint=0 };
-            (void)ledc_channel_config(&c_fan); (void)ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0);
-            g_pwm_fan_attached = true;
-        }
-        if (!g_pwm_pump_attached){
-            ledc_channel_config_t c_pump={ .gpio_num=PUMP_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                           .channel=LEDC_CHANNEL_1, .intr_type=LEDC_INTR_DISABLE,
-                                           .timer_sel=LEDC_TIMER_1, .duty=0, .hpoint=0 };
-            (void)ledc_channel_config(&c_pump); (void)ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,0);
-            g_pwm_pump_attached = true;
-        }
-        /* Start pump boost if armed */
-        if (g_pump_boost_armed){
-            uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-            float tgt = 100.0f;
-            float tC_pump = pick_source_temp(g_pump.source_mode);
-            if (!isnan(tC_pump)){
-                tC_pump = clampf(tC_pump, TEMP_MIN_C, TEMP_MAX_C);
-                float raw = eval_curve(&g_pump, tC_pump, false);
-                tgt = clampf(raw, 0.0f, 100.0f);
-            }
-            g_pump_boost_target = tgt;
-            g_pump_boost_start_ms = now_ms;
-            g_pump_boost_active = true;
-            g_pump_boost_armed = false;
-            ESP_LOGI(TAG, "PUMP BOOST: start (BLE target=%.1f%% fresh=%s)", (double)g_pump_boost_target, isnan(tC_pump)?"no":"yes");
-            pump_pwm_set_percent(0.0f); g_pump_last_appl = 0.0f; g_pump_last_filt = 0.0f;
-        }
-        /* Force immediate curve re-eval for fan */
-        g_fan_last_filt = NAN; g_pump_last_filt = isnan(g_pump_last_filt)?NAN:g_pump_last_filt; /* keep NAN if we want immediate */
-        g_fan_last_appl = NAN; /* pump_last_appl updated above if boost */
         if (g_purge_active) purge_stop();
+        /* Force immediate curve re-eval for fan */
+        g_fan_last_filt = NAN; g_pump_last_filt = NAN;
+        g_fan_last_appl = NAN; g_pump_last_appl = 0.0f;
+        g_start_pending = true; /* control_task will check NVS boost flag once */
+        g_lp_restore_ms = 0;     /* clear rearm state — system is starting */
+        g_system_running = true; /* set LAST so control_task sees consistent state */
     } else if (cmd[0]=='S' && cmd[1]=='P') {
-        /* 'SP' -> stop system: force PWM=0 and block control (mirrors UART SP) */
+        /* 'SP' -> stop system: set flags, heavy HW ops deferred to control_task */
         g_system_running = false;
-        fan_pwm_set_percent(0.0f);
-        pump_pwm_set_percent(0.0f);
-        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-        gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
-        gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
-        g_pwm_fan_attached = false; g_pwm_pump_attached = false;
-        uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-        g_forced_stop_deadline_ms = now_ms + 1500u;
+        g_waiting_for_temps = false; /* clear waiting flag on stop */
+        g_stop_pending = true;   /* control_task will kill LEDC/GPIO */
         /* Cancel any boost */
         g_pump_boost_active = false;
         bool will_arm = (g_purge_completed_since_last_stop || g_purge_seen_since_last_stop);
@@ -1547,10 +1966,9 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
         g_pump_boost_armed = was_armed || will_arm; /* preserve existing arm across extra STOPs */
         if (g_pump_boost_armed){
             ESP_LOGI(TAG, "PUMP BOOST: armed (via SP BLE) completed=%d seen=%d keep=%d", (int)g_purge_completed_since_last_stop, (int)g_purge_seen_since_last_stop, was_armed?1:0);
-        } else {
-            ESP_LOGI(TAG, "SP (BLE): no arm (completed=%d seen=%d)", (int)g_purge_completed_since_last_stop, (int)g_purge_seen_since_last_stop);
         }
         g_purge_completed_since_last_stop = false; g_purge_seen_since_last_stop = false;
+        if (g_purge_active) purge_stop(); /* cancel active purge on STOP */
     } else if (cmd[0]=='L' && cmd[1]=='K') {
         /* New: 'LK' + <byte> (non-zero to enable) */
         if (total >= 3){
@@ -1583,8 +2001,8 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
                 g_system_running = false;
                 fan_pwm_set_percent(0.0f);
                 pump_pwm_set_percent(0.0f);
-                (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-                (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+                (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
                 gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
                 gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
                 g_pwm_fan_attached = false; g_pwm_pump_attached = false;
@@ -1606,6 +2024,43 @@ static int ctrl_write_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
             }
             #endif
         }
+    } else if (cmd[0]=='O' && cmd[1]=='B') {
+        /* OLED brightness: 'OB' + <uint8> */
+        if (total >= 3){
+            uint8_t obr = cmd[2];
+            g_oled_brightness = obr;
+            if (g_oled_inited){
+                if (obr == 0){
+                    oled_send_cmd(0xAE); /* display off */
+                } else {
+                    oled_send_cmd(0xAF); /* display on */
+                    oled_send_cmd(0x81); oled_send_cmd(obr);
+                }
+            }
+            /* Persist to NVS */
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS_OLED, NVS_READWRITE, &h) == ESP_OK){
+                nvs_set_u8(h, NVS_KEY_OLED_BR, obr);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "CTRL: OLED brightness set to %u", (unsigned)obr);
+        }
+    } else if (cmd[0]=='D' && cmd[1]=='L') {
+        /* Display language: 'DL' + <uint8> (0=RU, 1=EN) */
+        if (total >= 3){
+            uint8_t lang = cmd[2] ? 1 : 0;
+            g_display_lang = lang;
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS_OLED, NVS_READWRITE, &h) == ESP_OK){
+                nvs_set_u8(h, NVS_KEY_OLED_LANG, lang);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "CTRL: display lang set to %s", lang ? "EN" : "RU");
+        }
+    } else if (cmd[0]=='T' && cmd[1]=='W') {
+        /* TW consumed but ignored: waiting flag is now derived locally in control_task */
     }
     return 0;
 }
@@ -1709,13 +2164,14 @@ static int gap_event(struct ble_gap_event *event, void *){
                 g_conn_handle=event->connect.conn_handle; g_ble_connected=true; gpio_set_level(LED_GPIO,1);
                 g_fan_last_filt=g_pump_last_filt=NAN; g_fan_last_appl=g_pump_last_appl=NAN;
                 fan_pwm_set_percent(0.0f); pump_pwm_set_percent(0.0f);
-                /* record connection start time for 10s post-connection grace */
+                /* Default to STOP on every (re)connection; app will send ST/SP
+                 * within ~200 ms to sync actual switch state, avoiding a
+                 * 1-second parasitic fan/pump spin-up. */
+                g_system_running = false;
+                /* record connection start time for 10s post-connection grace and ПОДКЛЮЧАЮ animation */
                 g_conn_start_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                /* Если профиль был сохранён ранее в NVS и не применён (после отключения мы гасим ленту),
-                   пометим его для немедленного применения. led_task проверяет g_led_dirty. */
-                if (g_led_prof.mode != LED_MODE_OFF){
-                    g_led_dirty = true;
-                }
+                g_ble_conn_since_ms = g_conn_start_ms;
+                /* LED profile is loaded at boot only when keep-on is enabled */
             } else {
                 struct ble_gap_adv_params advp={0}; advp.conn_mode=BLE_GAP_CONN_MODE_UND; advp.disc_mode=BLE_GAP_DISC_MODE_GEN;
                 ble_gap_adv_start(own_addr_type,NULL,BLE_HS_FOREVER,&advp,gap_event,NULL);
@@ -1724,10 +2180,17 @@ static int gap_event(struct ble_gap_event *event, void *){
                 case BLE_GAP_EVENT_DISCONNECT:
                         ESP_LOGI(TAG,"Disconnect; reason=%d", event->disconnect.reason);
                         g_conn_handle=0; g_ble_connected=false; gpio_set_level(LED_GPIO,0);
+                        g_cpu_temp_c = -1000; g_gpu_temp_c = -1000;
                         g_fan_last_filt=g_pump_last_filt=NAN; g_fan_last_appl=g_pump_last_appl=0.0f;
-                        /* clear connection start timestamp */
+                        /* clear connection start timestamps */
                         g_conn_start_ms = 0;
-                        fan_pwm_set_percent(0.0f); pump_pwm_set_percent(0.0f);
+                        g_ble_conn_since_ms = 0;
+                        /* Не обнулять вентиляторы/помпу если идёт продувка */
+                        if (!g_purge_active) {
+                            fan_pwm_set_percent(0.0f); pump_pwm_set_percent(0.0f);
+                        } else {
+                            ESP_LOGW(TAG, "BLE disconnect during purge – keeping PWM");
+                        }
                                 if (!g_ble_connected && !g_usb_connected && !g_led_allow_disconnected) {
                                     ESP_LOGI(TAG, "LED off due to BLE disconnect");
                                     leds_off();
@@ -1843,17 +2306,29 @@ typedef struct { uint8_t buf[4096]; size_t len; } stream_parser_t;
 static void sp_init(stream_parser_t* p){ memset(p,0,sizeof(*p)); }
 static void sp_consume(stream_parser_t* p, size_t n){ if(n>=p->len){ p->len=0; return; } memmove(p->buf,p->buf+n,p->len-n); p->len-=n; }
 
+static inline bool uart_session_active(void){
+    return g_usb_connected;
+}
+
 static int sp_try_tt(const uint8_t* d,size_t l,size_t* used){
     if (l < 10) return 0;
     if (!(d[0]=='T' && d[1]=='T')){ *used=1; return -1; }
     int32_t cpu=(int32_t)((uint32_t)d[2] | ((uint32_t)d[3]<<8) | ((uint32_t)d[4]<<16) | ((uint32_t)d[5]<<24));
     int32_t gpu=(int32_t)((uint32_t)d[6] | ((uint32_t)d[7]<<8) | ((uint32_t)d[8]<<16) | ((uint32_t)d[9]<<24));
+    /* Reject noise: real temperatures are -100..250 °C; random 4-byte values
+     * from UART line noise are almost never in this range. */
+    if (cpu < -100 || cpu > 250 || gpu < -100 || gpu > 250) {
+        *used = 10; return -1;
+    }
     g_cpu_temp_c=cpu; g_gpu_temp_c=gpu;
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     g_last_temp_ms = now_ms;
     if (!g_usb_connected) {
-        /* first time USB appears — record connection start for 10s grace */
+        /* first time USB appears — record connection start for 10s grace and ПОДКЛЮЧАЮ animation */
         g_conn_start_ms = now_ms;
+        g_usb_conn_since_ms = now_ms;
+        /* Default to STOP; app sends ST/SP to sync (parity with BLE) */
+        g_system_running = false;
     }
     g_usb_connected = true;
     g_last_usb_ms = now_ms;
@@ -1867,6 +2342,7 @@ static int sp_try_fc(const uint8_t* d,size_t l,size_t* used){
     size_t header = (ver==2)?7:6; size_t need=header + (size_t)n*3;
     if (n<2 || n>CURVE_POINTS_MAX){ *used=2; return -1; }
     if (l < need) return 0;
+    if (!uart_session_active()){ *used=need; return 1; } /* discard if no USB session */
     (void)apply_fc_bytes(d,(uint16_t)need);
     *used=need; return 1;
 }
@@ -1878,6 +2354,7 @@ static int sp_try_pc(const uint8_t* d,size_t l,size_t* used){
     size_t header = (ver==2)?7:6; size_t need=header + (size_t)n*3;
     if (n<2 || n>CURVE_POINTS_MAX){ *used=2; return -1; }
     if (l < need) return 0;
+    if (!uart_session_active()){ *used=need; return 1; } /* discard if no USB session */
     (void)apply_pc_bytes(d,(uint16_t)need);
     *used=need; return 1;
 }
@@ -1885,6 +2362,17 @@ static int sp_try_pc(const uint8_t* d,size_t l,size_t* used){
 static int sp_try_lx(const uint8_t* d,size_t l,size_t* used){
     if (l < 5) return 0;
     if (!(d[0]=='L' && d[1]=='X')){ *used=1; return -1; }
+    /* Reject if no active USB session — prevents UART noise from setting LED profile */
+    if (!uart_session_active()){
+        /* Still consume the correct number of bytes to keep parser in sync */
+        uint8_t mode = d[3];
+        size_t consume = 5;
+        if (mode == LED_MODE_CUSTOM) consume = 5 + (size_t)LED_STRIP_LENGTH * 3;
+        else if (mode == LED_MODE_GRADIENT_ANIM) consume = 12;
+        else if (l >= 8) consume = 8;
+        if (l < consume) return 0; /* wait for full packet before discarding */
+        *used = consume; return 1;
+    }
     /* Determine expected length by mode */
     if (l >= 5){
         uint8_t mode = d[3];
@@ -1915,74 +2403,47 @@ static int sp_try_lx(const uint8_t* d,size_t l,size_t* used){
 static int sp_try_pg(const uint8_t* d,size_t l,size_t* used){
     if (l < 2) return 0;
     if (!(d[0]=='P' && d[1]=='G')){ *used=1; return -1; }
+    if (!uart_session_active()){
+        *used = 2;
+        ESP_LOGW(TAG, "UART: 'PG' ignored (no USB session)");
+        return 1;
+    }
     *used=2; g_purge_seen_since_last_stop = true; purge_start(); return 1;
 }
 
 static int sp_try_st(const uint8_t* d,size_t l,size_t* used){
     if (l < 2) return 0;
     if (!(d[0]=='S' && d[1]=='T')){ *used=1; return -1; }
+    if (!uart_session_active()){
+        *used = 2;
+        ESP_LOGW(TAG, "UART: 'ST' ignored (no USB session)");
+        return 1;
+    }
     *used=2;
-    g_system_running = true;
-    /* Clear forced-stop guard and rebind LEDC channels to pins at safe 0% before resuming */
+    /* IMPORTANT: heavy LEDC re-attach and boost start are deferred to control_task
+     * to avoid stack overflow in the UART task context. */
     g_forced_stop_deadline_ms = 0;
-    /* Re-attach channels if they were detached earlier */
-    if (!g_pwm_fan_attached){
-        ledc_channel_config_t c_fan={ .gpio_num=FAN_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                      .channel=LEDC_CHANNEL_0, .intr_type=LEDC_INTR_DISABLE,
-                                      .timer_sel=LEDC_TIMER_0, .duty=0, .hpoint=0 };
-        (void)ledc_channel_config(&c_fan);
-        (void)ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0);
-        g_pwm_fan_attached = true;
-    }
-    if (!g_pwm_pump_attached){
-        ledc_channel_config_t c_pump={ .gpio_num=PUMP_PWM_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
-                                       .channel=LEDC_CHANNEL_1, .intr_type=LEDC_INTR_DISABLE,
-                                       .timer_sel=LEDC_TIMER_1, .duty=0, .hpoint=0 };
-        (void)ledc_channel_config(&c_pump);
-        (void)ledc_stop(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,0);
-        g_pwm_pump_attached = true;
-    }
-    /* Start pump boost if it was armed (after purge->stop). Snapshot target now. */
-    if (g_pump_boost_armed){
-        uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-        float tgt = 100.0f;
-        float tC_pump = pick_source_temp(g_pump.source_mode);
-        if (!isnan(tC_pump)){
-            tC_pump = clampf(tC_pump, TEMP_MIN_C, TEMP_MAX_C);
-            float raw = eval_curve(&g_pump, tC_pump, false);
-            tgt = clampf(raw, 0.0f, 100.0f);
-        }
-        g_pump_boost_target = tgt;
-        g_pump_boost_start_ms = now_ms;
-        g_pump_boost_active = true;
-        g_pump_boost_armed = false; /* consume arm */
-        ESP_LOGI(TAG, "PUMP BOOST: start (target=%.1f%% fresh=%s)", (double)g_pump_boost_target, isnan(tC_pump)?"no":"yes");
-        /* Immediately drive 0% to avoid stale last_appl interfering */
-        pump_pwm_set_percent(0.0f); g_pump_last_appl = 0.0f; g_pump_last_filt = 0.0f;
-    }
     if (g_purge_active) purge_stop();
+    g_fan_last_filt = NAN; g_pump_last_filt = NAN;
+    g_fan_last_appl = NAN; g_pump_last_appl = 0.0f;
+    g_start_pending = true; /* control_task will check NVS boost flag once */
+    g_lp_restore_ms = 0;     /* clear rearm state — system is starting */
+    g_system_running = true; /* set LAST so control_task sees consistent state */
     return 1;
 }
 
 static int sp_try_sp(const uint8_t* d,size_t l,size_t* used){
     if (l < 2) return 0;
     if (!(d[0]=='S' && d[1]=='P')){ *used=1; return -1; }
+    if (!uart_session_active()){
+        *used = 2;
+        ESP_LOGW(TAG, "UART: 'SP' ignored (no USB session)");
+        return 1;
+    }
     *used=2;
     g_system_running = false;
-    /* Immediately drive outputs to 0 and hold them for a short guard window */
-    fan_pwm_set_percent(0.0f);
-    pump_pwm_set_percent(0.0f);
-    /* Strongly drive pins low to avoid any float or post-close spikes */
-    (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-    gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
-    gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
-    g_pwm_fan_attached = false;
-    g_pwm_pump_attached = false;
-    uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-    g_forced_stop_deadline_ms = now_ms + 1500u;
+    g_waiting_for_temps = false; /* clear waiting flag on stop */
+    g_stop_pending = true;   /* control_task will kill LEDC/GPIO */
     /* Cancel any ongoing boost immediately */
     g_pump_boost_active = false;
     bool will_arm = (g_purge_completed_since_last_stop || g_purge_seen_since_last_stop);
@@ -1990,12 +2451,11 @@ static int sp_try_sp(const uint8_t* d,size_t l,size_t* used){
     g_pump_boost_armed = was_armed || will_arm; /* keep armed across extra STOPs */
     if (g_pump_boost_armed){
         ESP_LOGI(TAG, "PUMP BOOST: armed (via SP) completed=%d seen=%d keep=%d", (int)g_purge_completed_since_last_stop, (int)g_purge_seen_since_last_stop, was_armed?1:0);
-    } else {
-        ESP_LOGI(TAG, "SP: no arm (completed=%d seen=%d)", (int)g_purge_completed_since_last_stop, (int)g_purge_seen_since_last_stop);
     }
     /* Consume purge flags regardless */
     g_purge_completed_since_last_stop = false;
     g_purge_seen_since_last_stop = false;
+    if (g_purge_active) purge_stop(); /* cancel active purge on STOP */
     return 1;
 }
 
@@ -2003,6 +2463,7 @@ static int sp_try_sp(const uint8_t* d,size_t l,size_t* used){
 static int sp_try_lk(const uint8_t* d,size_t l,size_t* used){
     if (l < 3) return 0;
     if (!(d[0]=='L' && d[1]=='K')){ *used=1; return -1; }
+    if (!uart_session_active()){ *used=3; return 1; } /* discard if no USB session */
     bool new_flag = (d[2] != 0);
     g_led_allow_disconnected = new_flag;
     nvs_handle_t h; if (nvs_open(NVS_NS_LED, NVS_READWRITE, &h) == ESP_OK){
@@ -2026,6 +2487,7 @@ static int sp_try_lk(const uint8_t* d,size_t l,size_t* used){
 static int sp_try_lp(const uint8_t* d,size_t l,size_t* used){
     if (l < 3) return 0;
     if (!(d[0]=='L' && d[1]=='P')){ *used=1; return -1; }
+    if (!uart_session_active()){ *used=3; return 1; } /* discard if no USB session */
     bool en = (d[2] != 0);
     g_loopprot_enabled = en;
     nvs_handle_t h; if (nvs_open("sys", NVS_READWRITE, &h) == ESP_OK){
@@ -2038,6 +2500,7 @@ static int sp_try_lp(const uint8_t* d,size_t l,size_t* used){
 static int sp_try_hr(const uint8_t* d,size_t l,size_t* used){
     if (l < 3) return 0;
     if (!(d[0]=='H' && d[1]=='R')){ *used=1; return -1; }
+    if (!uart_session_active()){ *used=2; return 1; } /* discard if no USB session */
     char op = (char)d[2];
     if (op=='R'){
         *used = 3; /* consume header only */
@@ -2081,8 +2544,54 @@ static void sp_feed(stream_parser_t* p,const uint8_t* data,size_t len){
         if(p->len>=2 && p->buf[0]=='S' && p->buf[1]=='T'){ int r=sp_try_st(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
         if(p->len>=2 && p->buf[0]=='S' && p->buf[1]=='P'){ int r=sp_try_sp(p->buf,p->len,&used); if(r==0) break; sp_consume(p,used); continue; }
     /* Удалили калибровку по UART ('VC'): больше не поддерживается */
+        /* OLED brightness command 'OB' + <uint8>: sets display contrast 0..255 */
+        if(p->len>=2 && p->buf[0]=='O' && p->buf[1]=='B'){
+            if(p->len<3){ break; } /* wait for brightness byte */
+            if (!uart_session_active()){ sp_consume(p, 3); continue; } /* discard if no USB session */
+            uint8_t obr = p->buf[2];
+            g_oled_brightness = obr;
+            if (g_oled_inited){
+                if (obr == 0){
+                    oled_send_cmd(0xAE); /* display off */
+                } else {
+                    oled_send_cmd(0xAF); /* display on */
+                    oled_send_cmd(0x81); oled_send_cmd(obr);
+                }
+            }
+            /* Persist to NVS */
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS_OLED, NVS_READWRITE, &h) == ESP_OK){
+                nvs_set_u8(h, NVS_KEY_OLED_BR, obr);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "OLED: brightness set to %u", (unsigned)obr);
+            sp_consume(p, 3); continue;
+        }
+        /* Display language command 'DL' + <uint8>: 0=RU, 1=EN */
+        if(p->len>=2 && p->buf[0]=='D' && p->buf[1]=='L'){
+            if(p->len<3){ break; } /* wait for language byte */
+            if (!uart_session_active()){ sp_consume(p, 3); continue; } /* discard if no USB session */
+            uint8_t lang = p->buf[2] ? 1 : 0;
+            g_display_lang = lang;
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS_OLED, NVS_READWRITE, &h) == ESP_OK){
+                nvs_set_u8(h, NVS_KEY_OLED_LANG, lang);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "OLED: lang set to %s", lang ? "EN" : "RU");
+            sp_consume(p, 3); continue;
+        }
+        /* TW consumed but ignored: waiting flag is now derived locally in control_task */
+        if(p->len>=2 && p->buf[0]=='T' && p->buf[1]=='W'){
+            if(p->len<3){ break; }
+            sp_consume(p, 3); continue;
+        }
         /* OLED diagnostic trigger 'OD': toggles contrast/precharge set B and runs a pattern */
-        if(p->len>=2 && p->buf[0]=='O' && p->buf[1]=='D'){ size_t u=2; /* consume */ sp_consume(p,u);
+        if(p->len>=2 && p->buf[0]=='O' && p->buf[1]=='D'){ size_t u=2; /* consume */ 
+            if (!uart_session_active()){ sp_consume(p,u); continue; } /* discard if no USB session */
+            sp_consume(p,u);
             if (g_oled_inited){
                 /* Bump contrast & precharge and draw checkerboard */
                 oled_send_cmd(0x81); oled_send_cmd(0xFF);
@@ -2122,8 +2631,13 @@ static void uart_init(void){
         .source_clk=UART_SCLK_DEFAULT,
 #endif
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT,UART_RX_BUF_HW,UART_TX_BUF_HW,0,NULL,0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT,&cfg));
+    esp_err_t _ue = uart_driver_install(UART_PORT,UART_RX_BUF_HW,UART_TX_BUF_HW,0,NULL,0);
+    if (_ue != ESP_OK) { ESP_LOGE(TAG,"uart_driver_install failed: %s",esp_err_to_name(_ue)); g_err_uart_hw = true; return; }
+    _ue = uart_param_config(UART_PORT,&cfg);
+    if (_ue != ESP_OK) { ESP_LOGE(TAG,"uart_param_config failed: %s",esp_err_to_name(_ue)); g_err_uart_hw = true; return; }
+    /* Flush any garbage in RX FIFO left over from boot-ROM log at 74880 baud;
+     * without this, garbled bytes could momentarily match 'TT' and set g_usb_connected=true */
+    uart_flush_input(UART_PORT);
     xTaskCreate(uart_rx_task,"usb_uart_rx",UART_TASK_STACK,NULL,UART_TASK_PRIO,NULL);
 }
 
@@ -2142,6 +2656,8 @@ static void control_task(void *){
         if (g_usb_connected && (now - g_last_usb_ms > 5000)) {
             g_usb_connected = false;
             g_conn_start_ms = 0; /* clear post-connection timer on USB disconnect */
+            g_usb_conn_since_ms = 0;
+            g_cpu_temp_c = -1000; g_gpu_temp_c = -1000;
             ESP_LOGI(TAG, "CTRL: USB timeout - disconnected");
             if (!g_ble_connected && !g_usb_connected && !g_led_allow_disconnected) {
                 ESP_LOGI(TAG, "LED off due to USB timeout");
@@ -2163,6 +2679,69 @@ static void control_task(void *){
             if (tach_accum >= 1000){ tach_accum = 0; tach_sample_and_publish(1000); }
             continue;
         }
+
+        /* === Deferred STOP (heavy HW ops moved out of BLE/UART/loopprot contexts) ===
+         * SP/break handlers only set g_system_running=false + g_stop_pending=true;
+         * actual LEDC stop + GPIO pin-down happen here in control_task with ample stack. */
+        if (g_stop_pending) {
+            g_stop_pending = false;
+            fan_pwm_set_percent(0.0f);
+            pump_pwm_set_percent(0.0f);
+            (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
+            gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
+            g_pwm_fan_attached = false;
+            g_pwm_pump_attached = false;
+            g_forced_stop_deadline_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) + 1500u;
+            g_pump_boost_active = false;
+            ESP_LOGI(TAG, "CTRL: deferred STOP executed");
+        }
+
+        /* === Deferred LEDC re-attach (moved out of BLE/UART callbacks) ===
+         * Re-attach channels safely from this dedicated task context, avoiding
+         * stack overflow and para_up hang in the NimBLE / UART task. */
+        if (g_system_running && !g_pwm_fan_attached){
+            safe_ledc_attach_fan();
+            ESP_LOGI(TAG, "CTRL: fan channel re-attached");
+        }
+        if (g_system_running && !g_pwm_pump_attached){
+            safe_ledc_attach_pump();
+            ESP_LOGI(TAG, "CTRL: pump channel re-attached");
+        }
+        /* NOTE: boost arming from g_purge_completed_since_last_stop is handled
+         * exclusively in SP / ST command handlers to guarantee the STOP→START
+         * sequence.  control_task only checks the NVS persisted flag once,
+         * right after an ST command (g_start_pending). */
+        if (g_start_pending && g_system_running){
+            g_start_pending = false;
+            /* One-shot NVS check: arm boost from persisted flag (survives reboot between purge and ST) */
+            if (!g_pump_boost_armed && !g_pump_boost_active){
+                if (boost_flag_take_pending()){
+                    g_pump_boost_armed = true;
+                    ESP_LOGI(TAG, "PUMP BOOST: armed (NVS flag on ST)");
+                }
+            }
+        }
+        /* Deferred boost start: compute target and activate */
+        if (g_system_running && g_pump_boost_armed && g_pwm_pump_attached){
+            float tgt = 100.0f;
+            float tC_pump = pick_source_temp(g_pump.source_mode);
+            if (!isnan(tC_pump)){
+                tC_pump = clampf(tC_pump, TEMP_MIN_C, TEMP_MAX_C);
+                float raw = eval_curve(&g_pump, tC_pump, false);
+                tgt = clampf(raw, 0.0f, 100.0f);
+            }
+            g_pump_boost_target = tgt;
+            g_pump_boost_start_ms = now;
+            g_pump_boost_active = true;
+            g_pump_boost_armed = false;
+            pump_pwm_set_percent(0.0f); g_pump_last_appl = 0.0f; g_pump_last_filt = 0.0f;
+            ESP_LOGI(TAG, "PUMP BOOST: start (deferred target=%.1f%%)", (double)tgt);
+        }
+
         /* If pump boost is active, run it regardless of temp freshness */
         if (g_system_running && g_pump_boost_active){
             uint32_t elapsed = now - g_pump_boost_start_ms;
@@ -2266,6 +2845,17 @@ static void control_task(void *){
             }
         }
 
+        /* Derive waiting-for-temps flag from actual outputs:
+         * both fan and pump at 0% while system is running → temperatures
+         * have not yet reached the first curve point. */
+        if (g_system_running && !g_pump_boost_active) {
+            bool fan_zero  = !isnan(g_fan_last_appl)  && g_fan_last_appl  <= 0.001f;
+            bool pump_zero = !isnan(g_pump_last_appl) && g_pump_last_appl <= 0.001f;
+            g_waiting_for_temps = fan_zero && pump_zero;
+        } else {
+            g_waiting_for_temps = false;
+        }
+
         /* Tach sampling each ~1000 ms */
         tach_accum += CTRL_PERIOD_MS;
         if (tach_accum >= 1000){
@@ -2281,19 +2871,55 @@ static void control_task(void *){
 static void led_task(void *){
     const float breathe_period=2.5f, blink_period=0.8f;
     const TickType_t step_ticks=pdMS_TO_TICKS(80);
-    leds_init(); g_led_dirty=true; TickType_t start=xTaskGetTickCount();
+    leds_init();
+    /* Only mark dirty if keep-on is active and profile has something to show;
+     * otherwise profile is defaults (OFF) and there is nothing to apply. */
+    if (g_led_allow_disconnected && g_led_prof.mode != LED_MODE_OFF) g_led_dirty = true;
+    TickType_t start=xTaskGetTickCount();
     uint32_t last_init_ms = 0;
+    uint32_t last_delete_warn_ms = 0;
     bool led_is_off = false;
     for(;;){
-        /* Включаем/обновляем подсветку только при активной сессии и свежих температурах */
+        /* Включаем/обновляем подсветку только при активной сессии или если разрешено без подключения */
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         bool any_conn = (g_ble_connected || g_usb_connected);
-        bool fresh_temps = (g_last_temp_ms!=0) && ((now_ms - g_last_temp_ms) <= STALE_MS);
-        if ((!any_conn || !fresh_temps) && !g_led_allow_disconnected) {
-            /* Do not reinit just to turn off; if no handle, consider off */
+        if (!any_conn && !g_led_allow_disconnected) {
+            /* Force profile OFF so no stale animation plays later */
+            if (g_led_prof.mode != LED_MODE_OFF) {
+                g_led_prof.mode = LED_MODE_OFF;
+                g_led_prof.brightness = 0;
+            }
+            g_led_dirty = false; /* nothing to apply */
+            /* Handle stuck g_led_need_reinit: delete strip to stop any RMT output */
+            if (g_led_need_reinit && g_led_strip) {
+                if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
+                esp_err_t derr = led_strip_del(g_led_strip);
+                if (derr == ESP_OK) {
+                    g_led_strip = NULL;
+                    g_led_need_reinit = false;
+                    g_led_refresh_errs = 0;
+                    g_led_invalid_state_cnt = 0;
+                    esp_log_level_set("rmt", ESP_LOG_ERROR);
+                    esp_log_level_set("led_strip_rmt", ESP_LOG_ERROR);
+                    last_init_ms = now_ms;
+                } else if ((now_ms - last_delete_warn_ms) >= 1000) {
+                    ESP_LOGW(TAG, "LED strip delete deferred: %s", esp_err_to_name(derr));
+                    last_delete_warn_ms = now_ms;
+                }
+                if (g_led_mtx) xSemaphoreGive(g_led_mtx);
+            }
             if (!led_is_off) {
+                /* If strip was deleted (or never inited), re-create it to send
+                 * actual zeros to the WS2812 — otherwise noise-latched colours
+                 * persist on the physical LEDs even though software thinks they're off. */
                 if (g_led_strip == NULL) {
-                    led_is_off = true;
+                    if ((now_ms - last_init_ms) >= 200) { leds_init(); last_init_ms = now_ms; }
+                    if (g_led_strip == NULL) {
+                        /* init still failed — mark off to stop retrying every 80 ms */
+                        led_is_off = true;
+                    } else if (leds_off()) {
+                        led_is_off = true;
+                    }
                 } else if (leds_off()) {
                     led_is_off = true;
                 }
@@ -2309,16 +2935,33 @@ static void led_task(void *){
         if (g_led_need_reinit && g_led_strip) {
             if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
             /* Try to delete with small retries to allow RMT to become idle */
+            esp_err_t derr = ESP_FAIL;
             for (int tries=0; tries<5; ++tries){
-                esp_err_t derr = led_strip_del(g_led_strip);
-                if (derr == ESP_OK){ g_led_strip = NULL; break; }
+                derr = led_strip_del(g_led_strip);
+                if (derr == ESP_OK){
+                    g_led_strip = NULL;
+                    break;
+                }
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            g_led_need_reinit = false;
+            if (g_led_strip == NULL) {
+                g_led_need_reinit = false;
+                g_led_refresh_errs = 0;
+                g_led_invalid_state_cnt = 0;
+                /* Restore RMT log levels that were suppressed during error storm */
+                esp_log_level_set("rmt", ESP_LOG_ERROR);
+                esp_log_level_set("led_strip_rmt", ESP_LOG_ERROR);
+                g_led_dirty = true;
+                start = xTaskGetTickCount();
+                /* Start cooldown before attempting leds_init again */
+                last_init_ms = now_ms;
+            } else if ((now_ms - last_delete_warn_ms) >= 1000) {
+                ESP_LOGW(TAG, "LED strip delete deferred after retries: %s", esp_err_to_name(derr));
+                last_delete_warn_ms = now_ms;
+            }
             if (g_led_mtx) xSemaphoreGive(g_led_mtx);
-            /* Start cooldown before attempting leds_init again */
-            last_init_ms = now_ms;
         }
+        bool just_applied = false;
         if(g_led_dirty){
             g_led_dirty=false;
             if(g_led_prof.mode==LED_MODE_OFF) (void)leds_off();
@@ -2326,41 +2969,83 @@ static void led_task(void *){
             else if(g_led_prof.mode==LED_MODE_CUSTOM) leds_apply_custom();
             /* Gradient anim first frame handled in loop below; mark anim start by resetting start tick */
             start=xTaskGetTickCount();
+            just_applied = true;
         }
-        led_mode_t mode=(led_mode_t)g_led_prof.mode;
+        if (just_applied) {
+            /* Avoid multiple refreshes in the same tick after profile update */
+            vTaskDelay(step_ticks);
+            continue;
+        }
+        /* Snapshot profile under mutex to avoid torn reads while animation runs */
+        led_mode_t mode; uint8_t anim_speed=0; uint8_t start_r=0,start_g=0,start_b=0,end_r=0,end_g=0,end_b=0; uint8_t brightness=0;
+        if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
+        mode = (led_mode_t)g_led_prof.mode;
+        anim_speed = g_led_prof.anim_speed;
+        start_r = g_led_prof.start_r; start_g = g_led_prof.start_g; start_b = g_led_prof.start_b;
+        end_r = g_led_prof.end_r; end_g = g_led_prof.end_g; end_b = g_led_prof.end_b;
+        brightness = g_led_prof.brightness;
+        if (g_led_mtx) xSemaphoreGive(g_led_mtx);
         TickType_t now=xTaskGetTickCount();
         float elapsed=(float)(now-start)/(float)configTICK_RATE_HZ;
         if(mode==LED_MODE_BLINK){
             float phase=fmodf(elapsed,blink_period);
             bool on=(phase<(blink_period*0.5f));
-            uint8_t br=on?g_led_prof.brightness:0;
-            leds_apply_solid(g_led_prof.r,g_led_prof.g,g_led_prof.b,br);
+            uint8_t br=on?brightness:0;
+            leds_apply_solid(start_r,start_g,start_b,br);
         } else if(mode==LED_MODE_BREATHE){
             float s=0.5f*(1.0f + sinf(2.0f*(float)M_PI*(elapsed/breathe_period)));
-            int low=(int)(0.15f*(float)g_led_prof.brightness);
-            int br=low + (int)lroundf(s*(float)(g_led_prof.brightness-low));
-            leds_apply_solid(g_led_prof.r,g_led_prof.g,g_led_prof.b,clampu8(br));
+            int low=(int)(0.15f*(float)brightness);
+            int br=low + (int)lroundf(s*(float)(brightness-low));
+            leds_apply_solid(start_r,start_g,start_b,clampu8(br));
         } else if(mode==LED_MODE_GRADIENT_ANIM){
-            if (g_led_prof.anim_speed > 0) {
-                float t = fmodf(elapsed * g_led_prof.anim_speed / 5.0f, 1.0f);
+            if (anim_speed > 0) {
+                float t = fmodf(elapsed * anim_speed / 5.0f, 1.0f);
                 if (g_led_strip) {
                     if (g_led_need_reinit) { vTaskDelay(step_ticks); continue; }
-                    if (g_led_mtx) xSemaphoreTake(g_led_mtx, portMAX_DELAY);
+                    if (g_led_mtx && xSemaphoreTake(g_led_mtx, pdMS_TO_TICKS(5)) != pdTRUE) {
+                        vTaskDelay(step_ticks);
+                        continue;
+                    }
+                    /* Build frame: moving wave highlight from base(start) to peak(end) */
+                    const float radius = 6.0f; /* 5-6 pixels on each side */
+                    float center = t * (float)(LED_STRIP_LENGTH);
                     for(int i=0; i<LED_STRIP_LENGTH; i++){
-                        float local_t = fmodf((i / (float)(LED_STRIP_LENGTH-1)) + t, 1.0f);
-                        uint8_t r = (uint8_t)(g_led_prof.start_r + (g_led_prof.end_r - g_led_prof.start_r) * local_t);
-                        uint8_t g = (uint8_t)(g_led_prof.start_g + (g_led_prof.end_g - g_led_prof.start_g) * local_t);
-                        uint8_t b = (uint8_t)(g_led_prof.start_b + (g_led_prof.end_b - g_led_prof.start_b) * local_t);
-                        uint8_t br = scale_bright(r, g_led_prof.brightness);
-                        uint8_t bg = scale_bright(g, g_led_prof.brightness);
-                        uint8_t bb = scale_bright(b, g_led_prof.brightness);
+                        float d = fabsf((float)i - center);
+                        if (d > (float)LED_STRIP_LENGTH) d = fmodf(d, (float)LED_STRIP_LENGTH);
+                        float wrap = (float)LED_STRIP_LENGTH - d;
+                        if (wrap < d) d = wrap;
+                        float k = 0.0f;
+                        if (d <= radius) {
+                            k = 1.0f - (d / radius);
+                            /* smoothstep */
+                            k = k * k * (3.0f - 2.0f * k);
+                        }
+                        float rf = (float)start_r + ((float)end_r - (float)start_r) * k;
+                        float gf = (float)start_g + ((float)end_g - (float)start_g) * k;
+                        float bf = (float)start_b + ((float)end_b - (float)start_b) * k;
+                        uint8_t r = (uint8_t)clampf(rf, 0.0f, 255.0f);
+                        uint8_t g = (uint8_t)clampf(gf, 0.0f, 255.0f);
+                        uint8_t b = (uint8_t)clampf(bf, 0.0f, 255.0f);
+                        uint8_t br = scale_bright(r, brightness);
+                        uint8_t bg = scale_bright(g, brightness);
+                        uint8_t bb = scale_bright(b, brightness);
                         (void)led_strip_set_pixel(g_led_strip, i, br, bg, bb);
                     }
-                    esp_err_t err = led_strip_refresh(g_led_strip);
-                    if (err != ESP_OK) {
+                    esp_err_t err = led_refresh_safe();
+                    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
                         ESP_LOGE(TAG, "led_strip_refresh(gradient) failed: %d (schedule safe reinit)", err);
-                        g_led_need_reinit = true;
                     }
+                    led_note_refresh_result(err);
+#if LED_FRAME_DUPLICATE
+                    if (err == ESP_OK) {
+                        vTaskDelay(pdMS_TO_TICKS(2));
+                        esp_err_t err2 = led_refresh_safe();
+                        if (err2 != ESP_OK && err2 != ESP_ERR_INVALID_STATE) {
+                            ESP_LOGW(TAG, "led_strip_refresh(gradient) duplicate failed: %d", err2);
+                        }
+                        led_note_refresh_result(err2);
+                    }
+#endif
                     if (g_led_mtx) xSemaphoreGive(g_led_mtx);
                 }
             }
@@ -2379,12 +3064,19 @@ static void purge_task(void *arg){
     (void)arg;
     g_purge_active = true; g_purge_cancel = false;
     ESP_LOGI(TAG, "ПРОДУВКА: старт");
+    /* Clear forced-stop guard so valve/pump PWM is not blocked during purge */
+    g_forced_stop_deadline_ms = 0;
     /* Step 0: immediately stop fans and pumps */
     fan_pwm_set_percent(0.0f);
     pump_pwm_set_percent(0.0f);
-
+    /* Always force re-attach pump (and fan if needed) to guarantee clean LEDC
+     * timer+channel HW state — avoids para_up de-sync after fresh boot. */
+    if (!g_pwm_fan_attached)  safe_ledc_attach_fan();
+    g_pwm_pump_attached = false;
+    safe_ledc_attach_pump();
     /* Start valve PWM ramp in parallel with OFF-phase */
     valve_pwm_init();
+    ESP_LOGI(TAG, "ПРОДУВКА: valve=%d pump=%d fan=%d", (int)g_pwm_valve_attached, (int)g_pwm_pump_attached, (int)g_pwm_fan_attached);
     uint32_t start_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     const uint32_t ramp_ms = 3000;             /* 3s smooth close */
     const uint32_t off_ms = 1000;              /* OFF-phase (fans/pump off) */
@@ -2402,6 +3094,8 @@ static void purge_task(void *arg){
     while (!g_purge_cancel){
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
         uint32_t elapsed = now_ms - start_ms;
+
+        /* No display indicator here — ramp (НАПОЛНЯЮ) is shown during pump boost after purge */
 
         /* Valve PWM ramp: 40% -> 100% over ramp_ms, then hold 100% */
         if (elapsed < ramp_ms){
@@ -2451,17 +3145,17 @@ static void purge_task(void *arg){
     pump_pwm_set_percent(0.0f);
     valve_pwm_set_percent(0.0f);
 
-    /* Loop protection GPIOs - moved to app_main init */
+    /* ramp indicator not set here */
+
     g_purge_active = false;
-    /* Mark that purge has completed; if system already in STOP (g_system_running==false) arm immediately */
+    /* Mark that purge has completed.  Boost arming happens ONLY when
+     * the system transitions through STOP → START (SP then ST commands).
+     * We set the flag here; the SP handler will pick it up and arm boost,
+     * which will fire on the subsequent ST.  No immediate start — purge
+     * is meant to empty the lines and stay idle. */
     g_purge_completed_since_last_stop = true;
-    bool auto_arm = (!g_system_running); /* user was already in STOP state */
-    if (auto_arm){
-        if (!g_pump_boost_armed){
-            g_pump_boost_armed = true;
-            ESP_LOGI(TAG, "PUMP BOOST: auto-armed on purge completion (system stopped)");
-        }
-    }
+    /* Persist so boost survives power loss between purge and next start */
+    boost_flag_set_pending(true);
     ESP_LOGI(TAG, "ПРОДУВКА: завершено%s (system_running=%d boost_armed=%d)", g_purge_cancel?" (отменено)":"", (int)g_system_running, (int)g_pump_boost_armed);
     g_purge_cancel = false;
     g_purge_task = NULL;
@@ -2488,6 +3182,25 @@ static void purge_stop(void){
 
 /* ===== Entry point ===== */
 void app_main(void){
+    /* === CRITICAL: Pin fan/pump/LED GPIOs LOW immediately === */
+    /* Must happen before ANY other init (NVS, LED, etc.) because floating GPIOs
+       cause fan controllers to interpret the signal as 100% duty,
+       and floating LED_STRIP_GPIO lets WS2812 latch random noise as pixel data. */
+    {
+        const gpio_num_t early_pins[] = { (gpio_num_t)FAN_PWM_GPIO, (gpio_num_t)PUMP_PWM_GPIO, (gpio_num_t)LED_STRIP_GPIO };
+        for (int i = 0; i < 3; i++) {
+            gpio_config_t cfg = {
+                .pin_bit_mask = (1ULL << early_pins[i]),
+                .mode         = GPIO_MODE_OUTPUT,
+                .pull_up_en   = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_ENABLE,
+                .intr_type    = GPIO_INTR_DISABLE,
+            };
+            gpio_config(&cfg);
+            gpio_set_level(early_pins[i], 0);
+        }
+    }
+
     g_system_startup_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     /* Init NVS */
     esp_err_t nvs_ret = nvs_flash_init();
@@ -2502,7 +3215,9 @@ void app_main(void){
     pump_set_defaults(&g_pump);
     if(pump_load_from_nvs()!=ESP_OK){ ESP_LOGW(TAG,"PUMP: defaults"); pump_save_to_nvs(); }
     hours_load_from_nvs();
-    led_prof_load();
+    /* Clear any pending boost flag to prevent autonomous purge cycles */
+    boost_flag_set_pending(false);
+    ESP_LOGI(TAG, "Boost pending flag cleared at boot");
     /* Load optional setting: keep LEDs on without connection */
     {
         nvs_handle_t hflag; uint8_t fval = 0;
@@ -2516,7 +3231,16 @@ void app_main(void){
     }
     /* Create mutex for LED operations before any LED use */
     g_led_mtx = xSemaphoreCreateMutex();
+    /* Initialize LED defaults; load saved profile at boot only if keep-on is enabled */
+    led_prof_set_defaults();
+    if (g_led_allow_disconnected) {
+        led_prof_load();
+        if (g_led_prof.mode != LED_MODE_OFF) g_led_dirty = true;
+    }
     leds_init();
+    ESP_LOGI(TAG, "LED boot: allow_disconn=%d mode=%d br=%d dirty=%d",
+             (int)g_led_allow_disconnected, g_led_prof.mode,
+             g_led_prof.brightness, (int)g_led_dirty);
 
     gpio_set_direction(LED_GPIO,GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO,0);
@@ -2563,8 +3287,8 @@ void app_main(void){
             g_system_running = false;
             fan_pwm_set_percent(0.0f);
             pump_pwm_set_percent(0.0f);
-            (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-            (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+            (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, 0);
+            (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, 0);
             gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
             gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
             g_pwm_fan_attached = false; g_pwm_pump_attached = false;
@@ -2572,7 +3296,7 @@ void app_main(void){
             g_forced_stop_deadline_ms = now_ms + 1500u;
             g_pump_boost_active = false;
         }
-        xTaskCreate(loopprot_task, "loopprot", 2048, NULL, 5, NULL);
+        xTaskCreate(loopprot_task, "loopprot", 3072, NULL, 5, NULL);
     }
 
     /* UART */
@@ -2604,6 +3328,7 @@ void app_main(void){
         nimble_port_freertos_init(host_task);
     } else {
         ESP_LOGE(TAG,"BLE disabled due to init error: %s", esp_err_to_name(ret));
+        g_err_ble_hw = true;
     }
 #else
     ESP_LOGW(TAG,"Bluetooth NimBLE disabled in menuconfig");
@@ -2611,7 +3336,7 @@ void app_main(void){
 
     xTaskCreate(control_task,"fan_pump_ctrl",4096,NULL,5,NULL);
     xTaskCreate(led_task,"led_task",3072,NULL,4,&g_led_task);
-    xTaskCreate(oled_task,"oled_task",3072,NULL,3,NULL);
+    xTaskCreate(oled_task,"oled_task",4096,NULL,3,NULL);
 }
 /* ===== RPM calibration: load/save and one-time autocal at boot ===== */
 static void __attribute__((unused)) rpm_scale_load(void){
@@ -2710,94 +3435,821 @@ static void rpm_autocalibrate(void){
 }
 
 /* ===== OLED Task ===== */
+
+/* Smooth a scaled glyph by filling "staircase" corners.
+ * Scans the framebuffer region and wherever two diagonally adjacent pixels are
+ * ON but their shared orthogonal neighbours are OFF, fills one corner pixel to
+ * round off the blocky edges. */
+static void oled_smooth_region(int rx, int ry, int rw, int rh){
+    /* Work on a copy to avoid feedback during the scan */
+    for (int y = ry + 1; y < ry + rh - 1; ++y){
+        for (int x = rx + 1; x < rw + rx - 1; ++x){
+            /* current pixel must be ON */
+            int page = y >> 3; int bit = y & 7;
+            if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) continue;
+            size_t idx = (size_t)page * OLED_WIDTH + (size_t)x;
+            if (!(g_oled_fb[idx] & (1u << bit))) continue;
+
+            /* Check 4 diagonal directions; if diagonal is ON but the two
+             * orthogonal neighbours bridging it are OFF → fill one of them */
+            #define PX_ON(px, py) ( \
+                (px) >= 0 && (px) < OLED_WIDTH && (py) >= 0 && (py) < OLED_HEIGHT && \
+                (g_oled_fb[((py)>>3)*OLED_WIDTH+(px)] & (1u << ((py)&7))) )
+
+            /* top-right: if (x+1,y-1) ON, but (x+1,y) OFF and (x,y-1) OFF → fill (x+1,y-1 side) */
+            if (PX_ON(x+1,y-1) && !PX_ON(x+1,y) && !PX_ON(x,y-1))
+                oled_fb_set_pixel(x, y-1, true);
+            /* top-left */
+            if (PX_ON(x-1,y-1) && !PX_ON(x-1,y) && !PX_ON(x,y-1))
+                oled_fb_set_pixel(x, y-1, true);
+            /* bottom-right */
+            if (PX_ON(x+1,y+1) && !PX_ON(x+1,y) && !PX_ON(x,y+1))
+                oled_fb_set_pixel(x, y+1, true);
+            /* bottom-left */
+            if (PX_ON(x-1,y+1) && !PX_ON(x-1,y) && !PX_ON(x,y+1))
+                oled_fb_set_pixel(x, y+1, true);
+
+            #undef PX_ON
+        }
+    }
+}
+
 static void oled_task(void *arg){
-    /* U8g2-based OLED task with a short diagnostic sweep */
-    u8g2_t u8g2;
-    u8g2_espidf_sw_i2c_set_pins(21, 22);
-    /* Slow down SW I2C a bit for reliability */
-    u8g2_espidf_sw_i2c_set_delay_us(10);
-    /* На плате нет RST — не настраиваем аппаратный reset (-1) */
-    u8g2_espidf_sw_i2c_set_reset_pin(-1);
-    /* Probe I2C addresses first to confirm device presence */
-    uint8_t ack3c = u8g2_espidf_sw_i2c_probe(0x3C);
-    uint8_t ack3d = u8g2_espidf_sw_i2c_probe(0x3D);
-    ESP_LOGI(TAG, "OLED I2C probe: 0x3C=%u 0x3D=%u (1=ACK)", (unsigned)ack3c, (unsigned)ack3d);
-    typedef void (*setup_fn_t)(u8g2_t *u8g2, const u8g2_cb_t *rotation,
-                               u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_cb);
-    struct { setup_fn_t setup; const u8g2_cb_t* rot; const char* name; } combos[] = {
-        { u8g2_Setup_sh1107_64x128_f,           U8G2_R0, "SH1107 64x128 R0" },
-        { u8g2_Setup_sh1107_64x128_f,           U8G2_R2, "SH1107 64x128 R180" },
-        { u8g2_Setup_ssd1312_128x64_noname_f,   U8G2_R1, "SSD1312 128x64 R90" },
-        { u8g2_Setup_ssd1312_128x64_noname_f,   U8G2_R3, "SSD1312 128x64 R270" },
-        { u8g2_Setup_ssd1306_128x64_noname_f,   U8G2_R1, "SSD1306 128x64 R90" },
-        { u8g2_Setup_ssd1306_128x64_noname_f,   U8G2_R3, "SSD1306 128x64 R270" },
-    };
-    /* Diagnostic sweep: try both I2C addresses and several controller setups + flip_y */
-    const uint8_t addrs[] = { 0x3C, 0x3D };
-    for (size_t a=0; a<sizeof(addrs); ++a) {
-        for (size_t i=0; i<sizeof(combos)/sizeof(combos[0]); ++i) {
-            for (int flip=0; flip<=1; ++flip) {
-                ESP_LOGI(TAG, "OLED diag: addr=0x%02X %s flip_y=%d", (unsigned)addrs[a], combos[i].name, flip);
-                combos[i].setup(&u8g2, combos[i].rot, u8x8_byte_sw_i2c_espidf, u8x8_gpio_and_delay_espidf);
-                u8x8_SetI2CAddress(u8g2_GetU8x8(&u8g2), addrs[a] << 1);
-                u8g2_InitDisplay(&u8g2);
-                u8g2_SetPowerSave(&u8g2, 0);
-                u8g2_SetFlipMode(&u8g2, flip);
-                u8g2_SetContrast(&u8g2, 255);
-                /* Fill screen to make any reaction visible */
-                u8g2_ClearBuffer(&u8g2);
-                u8g2_DrawBox(&u8g2, 0, 0, u8g2_GetDisplayWidth(&u8g2), u8g2_GetDisplayHeight(&u8g2));
-                u8g2_SendBuffer(&u8g2);
-                vTaskDelay(pdMS_TO_TICKS(250));
-                /* Show text banner */
-                u8g2_ClearBuffer(&u8g2);
-                u8g2_SetFont(&u8g2, u8g2_font_6x12_tf);
-                u8g2_DrawStr(&u8g2, 0, 12, "OLED diag:");
-                u8g2_DrawStr(&u8g2, 0, 26, combos[i].name);
-                char abuf[24]; snprintf(abuf, sizeof(abuf), "addr=0x%02X flip=%d", (unsigned)addrs[a], flip);
-                u8g2_DrawStr(&u8g2, 0, 40, abuf);
-                u8g2_SendBuffer(&u8g2);
-                vTaskDelay(pdMS_TO_TICKS(500));
+    (void)arg;
+    oled_init();
+    if (!g_oled_inited){
+        ESP_LOGE(TAG, "OLED: init failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Capture display-ready timestamp — countdown starts from THIS moment, not app_main */
+    uint32_t oled_ready_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "OLED: task started (portrait 64x128)");
+
+    /* Draw a single char at integer scale S */
+    #define DRAW_CHAR_S(x0, y0, ch, S) do { \
+        const uint8_t* _g = font5x7_get(ch); \
+        for (int _dx = 0; _dx < 5; ++_dx){ \
+            uint8_t _col = _g[_dx]; \
+            for (int _dy = 0; _dy < 7; ++_dy){ \
+                if ((_col >> _dy) & 1u){ \
+                    for (int _sy = 0; _sy < (S); ++_sy) \
+                        for (int _sx = 0; _sx < (S); ++_sx) \
+                            oled_fb_set_pixel((x0)+_dx*(S)+_sx, (y0)+_dy*(S)+_sy, true); \
+                } \
+            } \
+        } \
+    } while(0)
+
+    /* Draw text at scale S with stride = 6*S per char */
+    #define DRAW_TEXT_S(x0, y0, str, S) do { \
+        const char* _s = (str); int _x = (x0); \
+        for (int _k = 0; _s[_k]; ++_k){ \
+            DRAW_CHAR_S(_x, (y0), _s[_k], (S)); \
+            _x += 6 * (S); \
+        } \
+    } while(0)
+
+    /* Draw integer right-aligned at scale S, `width` char slots, stride per slot */
+    #define DRAW_INT_S(x0, y0, val, width, S, stride) do { \
+        char _buf[12]; int _v = (val); \
+        int _neg = (_v < 0); if (_neg) _v = -_v; \
+        int _i = 0; \
+        if (_v == 0) { _buf[_i++] = '0'; } \
+        else { while (_v > 0 && _i < 10) { _buf[_i++] = '0' + (_v % 10); _v /= 10; } } \
+        if (_neg && _i < 11) _buf[_i++] = '-'; \
+        int _pad = (width) - _i; \
+        for (int _p = 0; _p < _pad; ++_p) DRAW_CHAR_S((x0) + _p * (stride), (y0), ' ', (S)); \
+        for (int _j = 0; _j < _i; ++_j) DRAW_CHAR_S((x0) + (_pad + _i - 1 - _j) * (stride), (y0), _buf[_j], (S)); \
+    } while(0)
+
+    /* Same as DRAW_INT_S but pads with '0' instead of space (for animations: 01 02 ... 09) */
+    #define DRAW_INT_ZP_S(x0, y0, val, width, S, stride) do { \
+        char _buf[12]; int _v = (val); \
+        int _neg = (_v < 0); if (_neg) _v = -_v; \
+        int _i = 0; \
+        if (_v == 0) { _buf[_i++] = '0'; } \
+        else { while (_v > 0 && _i < 10) { _buf[_i++] = '0' + (_v % 10); _v /= 10; } } \
+        if (_neg && _i < 11) _buf[_i++] = '-'; \
+        int _pad = (width) - _i; \
+        for (int _p = 0; _p < _pad; ++_p) DRAW_CHAR_S((x0) + _p * (stride), (y0), '0', (S)); \
+        for (int _j = 0; _j < _i; ++_j) DRAW_CHAR_S((x0) + (_pad + _i - 1 - _j) * (stride), (y0), _buf[_j], (S)); \
+    } while(0)
+
+    /* Draw a 5x7 icon glyph (column-major, LSB=top) at position, with optional scale */
+    #define DRAW_ICON(x0, y0, cols5, S) do { \
+        for (int _dx = 0; _dx < 5; ++_dx){ \
+            uint8_t _col = (cols5)[_dx]; \
+            for (int _dy = 0; _dy < 7; ++_dy){ \
+                if ((_col >> _dy) & 1u){ \
+                    for (int _sy = 0; _sy < (S); ++_sy) \
+                        for (int _sx = 0; _sx < (S); ++_sx) \
+                            oled_fb_set_pixel((x0)+_dx*(S)+_sx, (y0)+_dy*(S)+_sy, true); \
+                } \
+            } \
+        } \
+    } while(0)
+
+    /* --- Status bar icons (5 cols × 7 rows, column-major, LSB=top) --- */
+    /* Bluetooth symbol (stylised B with arrowheads) */
+    static const uint8_t ico_bt[5]   = {0x22, 0x14, 0x7F, 0x2A, 0x14};
+    /* USB symbol (trident-like) */
+    static const uint8_t ico_usb[5]  = {0x08, 0x1C, 0x7F, 0x1C, 0x08};
+    /* Ready: bold checkmark (thicker strokes) */
+    static const uint8_t ico_rdy[5]  = {0x30,0x60,0x30,0x18,0x0C};
+    /* Loading: dot count cycles 0..2 (animated via load_frame) */
+    static int load_frame = 0;
+    /* Warning triangle icon (5×7, column-major, LSB=top):
+     *  row0: . . X . .    row1: . X . X .    row2: X . . . X
+     *  row3: X . . . X    row4: X X X X X */
+    static const uint8_t ico_warn[5] = {0x1C, 0x12, 0x11, 0x12, 0x1C};
+
+    /* Layout constants.
+     * Scale 2 for digits.
+     * 3 temperature sections + separator lines + status bar at bottom.
+     *
+     * Section height 35px: 5(pad) + 7(label) + 2(gap) + 14(digits) + 7(pad) = 35px
+     * 3 sections × 35 = 105.  2 separators + 1 status sep = 3.  Status bar: 20.
+     * Total: 105 + 3 + 20 = 128.  Tighter padding, larger status bar. */
+    const int SCALE    = 2;
+    const int DIG_W    = 5 * SCALE;       /* 10 */
+    const int DIG_STR  = DIG_W + 1;      /* 11 — stride between 2x chars */
+    const int DIG_H    = 7 * SCALE;       /* 14 */
+    const int DEGC_W   = 16;             /* 4(ring) + 2(gap) + 10(C@2x) */
+    const int SEC_H    = 35;             /* section height */
+    const int STATUS_H = 20;            /* status bar height */
+    const int STATUS_Y = 128 - STATUS_H; /* y=108 */
+
+    /* Screen timeout state */
+    uint32_t disconn_since_ms = 0; /* ms-timestamp when no-connection state began (0 = connected) */
+    bool screen_off = false;       /* true after fade-out; suppresses render until fade-in */
+    /* Frame index at which the ПОДКЛЮЧАЮ animation started (-1 = not active) */
+    int conn_frame_base = -1;
+    /* Wall-clock deadline (ms) until which ПОДКЛЮЧАЮ animation is active.
+     * Set once when connection is first latched; is_connecting is derived purely
+     * from this timestamp so no transport flicker can make errors bleed through. */
+    uint32_t conn_anim_end_ms = 0;
+    /* Wall-clock error blink: ЗАЩИТА/ОШИБКА alternates with РАБОТА/ПАУЗА every
+     * ERR_BLINK_HALF_MS ms, independent of load_frame — speed never changes. */
+    #define ERR_BLINK_HALF_MS 500u
+    bool     err_blink_on        = false;
+    uint32_t err_blink_toggle_ms = 0;
+    /* Frame index at which the ПРОДУВКА animation started (-1 = not active) */
+    int purge_frame_base = -1;
+    /* Frame index at which the НАПОЛНЯЮ (ramp) animation started (-1 = not active) */
+    int ramp_frame_base = -1;
+    /* After purge finishes, suppress "РАБОТА" for a grace period while
+     * the system transitions to STOP (g_system_running drop may lag by 1-3 s). */
+    bool     prev_purge_active = false;
+    uint32_t purge_ended_ms    = 0;
+    #define PURGE_WORK_SUPPRESS_MS 3000u
+    /* Waiting-for-target-temps marquee scroll state */
+    int      wait_scroll_px          = 0;
+    bool     prev_waiting_for_temps  = false;
+    uint32_t wait_scroll_ms          = 0;
+    #define WAIT_SCROLL_PERIOD_MS 30u   /* ~33 px/s, smooth marquee scroll */
+    /* Hydroline disconnected marquee scroll state */
+    int      hydro_scroll_px         = 0;
+    bool     prev_hydro_active       = false;
+    uint32_t hydro_scroll_ms         = 0;
+    #define HYDRO_SCROLL_PERIOD_MS 30u  /* ~33 px/s, same speed as waiting scroll */
+    /* How long to show "ПОДКЛЮЧАЮ" after a new BLE/USB connection */
+    #define CONNECTING_SHOW_MS 4000u
+
+    /* Per-channel connect-in animation: fires when a channel transitions -1000→real.
+     * Counts 0 → actual over CONN_ANIM_DUR_MS at 20 ms/frame. */
+    #define CONN_ANIM_DUR_MS (22u * 94u)   /* same as boot countdown: 2068 ms */
+    int32_t prev_ch[3]        = {-1000, -1000, -1000}; /* last seen value per channel */
+    uint32_t ch_anim_start[3] = {0, 0, 0};             /* 0 = not active             */
+
+    /* Timestamp of last load_frame advance. load_frame ticks every 94 ms regardless
+     * of how fast the OLED loop runs — so ЗАГРУЗКА speed is always correct even
+     * when we refresh the screen at 20 ms during the boot digit countdown. */
+    uint32_t last_load_frame_ms = oled_ready_ms;
+
+    for (;;){
+        oled_fb_clear();
+
+        /* ----- Screen timeout: 10 min no-connection -> fade out; on connect -> fade in ----- */
+        {
+            bool any_conn = g_ble_connected || g_usb_connected;
+            uint32_t t_now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+            if (any_conn) {
+                disconn_since_ms = 0;
+                if (screen_off) {
+                    /* Fade in: 0 -> g_oled_brightness over 3 s (60 steps × 50 ms) */
+                    uint8_t target = g_oled_brightness;
+                    for (int s = 0; s <= 60; s++) {
+                        uint8_t br = (uint8_t)((uint32_t)target * (uint32_t)s / 60u);
+                        oled_send_cmd(0x81); oled_send_cmd(br);
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    screen_off = false;
+                }
+            } else {
+                if (disconn_since_ms == 0) disconn_since_ms = t_now ? t_now : 1u;
+                if (!screen_off && (t_now - disconn_since_ms) >= 600000u) {
+                    /* Fade out: g_oled_brightness -> 0 over 3 s (60 steps × 50 ms) */
+                    uint8_t start_br = g_oled_brightness;
+                    for (int s = 60; s >= 0; s--) {
+                        uint8_t br = (uint8_t)((uint32_t)start_br * (uint32_t)s / 60u);
+                        oled_send_cmd(0x81); oled_send_cmd(br);
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    screen_off = true;
+                }
+            }
+
+            /* While screen is off: skip rendering, poll at 1 Hz */
+            if (screen_off) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
         }
-    }
-    /* Choose SSD1306 128x64 R90 (acts as 64x128) on 0x3C as the default like ESPHome, flip_y=false */
-    size_t def = 4; /* index of SSD1306 128x64 R90 */
-    combos[def].setup(&u8g2, combos[def].rot, u8x8_byte_sw_i2c_espidf, u8x8_gpio_and_delay_espidf);
-    u8x8_SetI2CAddress(u8g2_GetU8x8(&u8g2), 0x3C << 1);
-    u8g2_InitDisplay(&u8g2);
-    u8g2_SetPowerSave(&u8g2, 0);
-    u8g2_SetFlipMode(&u8g2, 0);
-    u8g2_SetContrast(&u8g2, 220);
-    TickType_t last = xTaskGetTickCount();
-    for(;;){
-        const char *title = "VODA";
-        char value[16] = {0};
-        uint32_t now = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-        bool fresh = (g_last_water_ms!=0) && (now - g_last_water_ms <= 1500);
-        if (fresh && g_water_temp_c > -500){
-            int v = (int)g_water_temp_c;
-            bool neg = v < 0; if (neg) v = -v;
-            char tmp[8]; int n = 0; do { tmp[n++] = (char)('0' + (v%10)); v/=10; } while(v && n<7);
-            int pos=0; if (neg) value[pos++]='-';
-            for(int i=n-1;i>=0;--i){ value[pos++]=tmp[i]; }
-            value[pos++]='C'; value[pos]=0;
-        } else {
-            strcpy(value, "ERR");
+
+        /* ---- Boot countdown for temperatures: 99 → actual (or 99 → 00 → "--") over 5 s ---- */
+        /* Use oled_ready_ms (display-ready time) so the full 5 s is always visible */
+        uint32_t bc_now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+        /* Detect purge end: latch timestamp for РАБОТА-suppress grace period */
+        {
+            bool cur_purge = g_purge_active;
+            if (prev_purge_active && !cur_purge)
+                purge_ended_ms = bc_now ? bc_now : 1u;
+            prev_purge_active = cur_purge;
         }
-        u8g2_ClearBuffer(&u8g2);
-        u8g2_SetFont(&u8g2, u8g2_font_6x12_tf);
-        int dw = u8g2_GetDisplayWidth(&u8g2);
-        int x1 = (dw - u8g2_GetStrWidth(&u8g2, title)) / 2;
-        int x2 = (dw - u8g2_GetStrWidth(&u8g2, value)) / 2;
-        int h  = u8g2_GetDisplayHeight(&u8g2);
-        int y1 = (h >= 64) ? (h/4) : 12;
-        int y2 = (h >= 64) ? (h/2) : 28;
-        u8g2_DrawStr(&u8g2, x1<0?0:x1, y1, title);
-        u8g2_DrawStr(&u8g2, x2<0?0:x2, y2, value);
-        u8g2_SendBuffer(&u8g2);
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+        uint32_t bc_elapsed = bc_now - oled_ready_ms;
+        /* Duration = 22 frames × 94 ms — exactly matches the ЗАГРУЗКА animation,
+         * so digits and status bar animation end at the same tick. One-shot: once
+         * bc_elapsed exceeds this value it is never <2068 again (oled_ready_ms is fixed). */
+        bool is_boot_countdown = (bc_elapsed < CONN_ANIM_DUR_MS);
+
+        /* ---- Detect -1000→real transitions and latch connect-in animation start times ---- */
+        {
+            int32_t cur[3] = {g_cpu_temp_c, g_gpu_temp_c, g_water_temp_c};
+            for (int ci = 0; ci < 3; ++ci) {
+                if (prev_ch[ci] <= -1000 && cur[ci] > -1000 && !is_boot_countdown) {
+                    /* Channel just got first real data after boot countdown finished */
+                    ch_anim_start[ci] = bc_now ? bc_now : 1u;
+                }
+                if (cur[ci] <= -1000) {
+                    /* Data lost: reset so animation re-fires next time data arrives */
+                    ch_anim_start[ci] = 0;
+                }
+                prev_ch[ci] = cur[ci];
+            }
+        }
+        /* Any connect-in animation active? (drives 20 ms frame rate) */
+        bool is_conn_anim = false;
+        for (int ci = 0; ci < 3; ++ci) {
+            if (ch_anim_start[ci] != 0 && (bc_now - ch_anim_start[ci]) < CONN_ANIM_DUR_MS)
+                is_conn_anim = true;
+        }
+
+        /* ---- 3 temperature sections ---- */
+        for (int sec = 0; sec < 3; ++sec){
+            int sy = sec * (SEC_H + 1);   /* +1 for separator pixel */
+            const char* label;
+            int temp;
+
+            switch (sec){
+                case 0: label = g_display_lang ? "CPU"   : "ЦП";   temp = (int)g_cpu_temp_c;   break;
+                case 1: label = g_display_lang ? "GPU"   : "ГП";   temp = (int)g_gpu_temp_c;   break;
+                default: label = g_display_lang ? "WATER" : "ВОДА"; temp = (int)g_water_temp_c; break;
+            }
+
+            /* Boot countdown: animate digits from 99 down to actual value.
+             * Duration matches ЗАГРУЗКА exactly: 22 frames × 94 ms = 2068 ms.
+             * Connected (temp > -1000): lerp 99 → actual.
+             * No data (temp == -1000): count 99 → 0, then normal "--". */
+            if (is_boot_countdown) {
+                float prog = (float)bc_elapsed / (float)CONN_ANIM_DUR_MS;
+                if (prog > 1.0f) prog = 1.0f;
+                if (temp > -1000) {
+                    temp = 99 + (int)((float)(temp - 99) * prog + 0.5f);
+                } else {
+                    temp = 99 - (int)(99.0f * prog + 0.5f);
+                }
+            } else if (ch_anim_start[sec] != 0 && temp > -1000) {
+                /* Connect-in animation: count 0 → actual over CONN_ANIM_DUR_MS */
+                uint32_t ch_elapsed = bc_now - ch_anim_start[sec];
+                if (ch_elapsed < CONN_ANIM_DUR_MS) {
+                    float prog = (float)ch_elapsed / (float)CONN_ANIM_DUR_MS;
+                    temp = (int)((float)temp * prog + 0.5f);
+                }
+                /* When elapsed >= CONN_ANIM_DUR_MS: show actual value as-is */
+            }
+
+            /* Label: 1x centred (use codepoint count for UTF-8 strings) */
+            int lbl_w = utf8_charlen(label);
+            oled_draw_text((64 - lbl_w * 6) / 2, sy + 5, label);
+
+            /* Count digits for horizontal centering */
+            int ndig = 0;
+            int dig_y = sy + 14;
+
+            if (temp <= -1000) {
+                ndig = 2;  /* "--" + °C */
+            } else {
+                int tv = temp < 0 ? -temp : temp;
+                if (tv >= 100) ndig = 3;
+                else if (tv >= 10) ndig = 2;
+                else ndig = 1;
+                if (temp < 0) ndig++;
+            }
+
+            /* During any digit animation keep at least 2 digits so "01..09" never shifts
+             * layout compared to "10..99". Applies to both boot countdown and connect-in. */
+            bool sec_anim_active = is_boot_countdown ||
+                (ch_anim_start[sec] != 0 && (bc_now - ch_anim_start[sec]) < CONN_ANIM_DUR_MS);
+            if (sec_anim_active && ndig < 2) ndig = 2;
+
+            /* total width: digits + gap + °C */
+            int total_w = (ndig - 1) * DIG_STR + DIG_W + 2 + DEGC_W;
+            int dig_x = (64 - total_w) / 2;
+            if (dig_x < 0) dig_x = 0;
+
+            if (temp <= -1000) {
+                DRAW_CHAR_S(dig_x + 0 * DIG_STR, dig_y, '-', SCALE);
+                DRAW_CHAR_S(dig_x + 1 * DIG_STR, dig_y, '-', SCALE);
+            } else if (sec_anim_active) {
+                DRAW_INT_ZP_S(dig_x, dig_y, temp, ndig, SCALE, DIG_STR);
+            } else {
+                DRAW_INT_S(dig_x, dig_y, temp, ndig, SCALE, DIG_STR);
+            }
+
+            /* Smooth the digit region */
+            oled_smooth_region(dig_x, dig_y, ndig * DIG_STR, DIG_H);
+
+            /* °C: degree ring (4x4) + C at 2x, vertically centred with digits */
+            int degc_x = dig_x + (ndig - 1) * DIG_STR + DIG_W + 2;
+            int degc_y = dig_y + (DIG_H - 14) / 2;
+            /* degree ring */
+            oled_fb_set_pixel(degc_x+1, degc_y,   true);
+            oled_fb_set_pixel(degc_x+2, degc_y,   true);
+            oled_fb_set_pixel(degc_x,   degc_y+1, true);
+            oled_fb_set_pixel(degc_x+3, degc_y+1, true);
+            oled_fb_set_pixel(degc_x,   degc_y+2, true);
+            oled_fb_set_pixel(degc_x+3, degc_y+2, true);
+            oled_fb_set_pixel(degc_x+1, degc_y+3, true);
+            oled_fb_set_pixel(degc_x+2, degc_y+3, true);
+            /* C at 2x */
+            DRAW_CHAR_S(degc_x + 6, degc_y, 'C', 2);
+
+            /* Separator line between sections (sparse dithered: 1 dot every 5px) */
+            if (sec < 2){
+                int sep_y = sy + SEC_H;
+                for (int x = 4; x < 60; x += 5)
+                    oled_fb_set_pixel(x, sep_y, true);
+            }
+        }
+
+        /* ---- Status bar (y = STATUS_Y .. 127) ---- */
+        /* Separator above status bar (sparse dithered: 1 dot every 5px) */
+        for (int x = 0; x < 64; x += 5)
+            oled_fb_set_pixel(x, STATUS_Y - 1, true);
+
+        int ico_y = STATUS_Y + (STATUS_H - 7) / 2;  /* vertically centre 7px icon */
+
+        /* Determine connection state */
+        /* 2 cycles × 11 frames × 94 ms ≈ 2.1 s boot animation */
+        bool is_loading = (load_frame < 22);
+
+#if CONFIG_BT_NIMBLE_ENABLED
+        bool ble_on = g_ble_connected;
+        bool usb_on = g_usb_connected;
+#else
+        bool ble_on = false;
+        bool usb_on = g_usb_connected;
+#endif
+        /* ПОДКЛЮЧАЮ: latch animation when a new connection first appears.
+         * is_connecting is derived exclusively from a wall-clock deadline
+         * (conn_anim_end_ms) so NO transport flicker, disconnect, or loop-break
+         * event can cut it short — ЗАЩИТА and all other errors are unconditionally
+         * blocked for the full 2750 ms animation window (22 frames × 125 ms). */
+        {
+            bool any_new_conn = !is_loading &&
+                ((ble_on && g_ble_conn_since_ms != 0) ||
+                 (usb_on && g_usb_conn_since_ms != 0));
+            if (any_new_conn) {
+                if (conn_frame_base < 0) {
+                    conn_frame_base  = load_frame;          /* latch frame base for letter reveal */
+                    conn_anim_end_ms = bc_now + 22u * 125u; /* wall-clock deadline: 2750 ms */
+                }
+            } else {
+                /* Expire only after the full wall-clock window has passed */
+                if (bc_now >= conn_anim_end_ms)
+                    conn_frame_base = -1;
+            }
+        }
+        /* Pure wall-clock gate: once triggered, stays true for the full 2750 ms
+         * regardless of what happens to the connection state. */
+        bool is_connecting = (conn_anim_end_ms != 0) && (bc_now < conn_anim_end_ms) && !is_loading;
+
+        /* ПРОДУВКА: show while g_purge_active, looping; latch frame base so animation
+         * always starts from the first letter regardless of load_frame value.
+         * Ensure that once started, the animation finishes at least one full
+         * reveal+pause cycle even if purge ends early. */
+        {
+            const int PURGE_FULL_FRAMES = 11; /* reveal (0..7) + pause (8..10) */
+            if (g_purge_active) {
+                if (purge_frame_base < 0) purge_frame_base = load_frame;
+            } else {
+                if (purge_frame_base >= 0) {
+                    if ((load_frame - purge_frame_base) >= PURGE_FULL_FRAMES) purge_frame_base = -1;
+                } else {
+                    purge_frame_base = -1;
+                }
+            }
+        }
+        bool is_purging = (purge_frame_base >= 0);
+
+        /* RAMP (НАПОЛНЯЮ): show while pump boost is active (post-purge filling).
+         * Once started, allow the animation to finish at least one full cycle
+         * even if pump boost ends prematurely. */
+        {
+            const int RAMP_FULL_FRAMES = 11; /* reveal+pause frames */
+            if (g_pump_boost_active) {
+                if (ramp_frame_base < 0) ramp_frame_base = load_frame;
+            } else {
+                if (ramp_frame_base >= 0) {
+                    if ((load_frame - ramp_frame_base) >= RAMP_FULL_FRAMES) ramp_frame_base = -1;
+                } else {
+                    ramp_frame_base = -1;
+                }
+            }
+        }
+        bool is_ramping = (ramp_frame_base >= 0);
+
+        /* ----- Compute highest-priority active error code -----
+         *  err 1: fan or pump stall (PWM > 1% but RPM < threshold)
+         *  err 2: BLE hardware/stack init failed
+         *  err 3: UART/USB hardware init failed
+         *  err 4: DS18B20 water sensor dead > 60 s after first response
+         *  err 5: liquid loop broken (hose/leak, loop-protection enabled)
+         *  err 6: water temperature critical (>= WATER_TEMP_CRIT_C °C)
+         */
+        uint32_t now_err = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        bool e1 = (g_rpm_flags & (RPM_FLAG_F1 | RPM_FLAG_F2)) != 0;
+        bool e2 = g_err_ble_hw;
+        bool e3 = g_err_uart_hw;
+        /* err 4: sensor was seen at least once AND has been silent > 60 s */
+        bool e4 = (g_last_water_ms != 0) && ((now_err - g_last_water_ms) > 60000u);
+        /* err 5: loop protection active AND loop is currently broken */
+        bool e5 = g_loopprot_enabled && !g_loop_ok;
+        /* err 6: water temp is valid AND has exceeded critical threshold */
+        bool e6 = (g_water_temp_c > -1000) && (g_water_temp_c >= WATER_TEMP_CRIT_C);
+        int active_err = 0;
+        /* Priority: e6 (water overheat) > e5 (loop broken) > e1 (fan stall) > e4 (sensor dead) > e2/e3 (hw init) */
+        if      (e6) active_err = 6;
+        else if (e5) active_err = 5;
+        else if (e1) active_err = 1;
+        else if (e4) active_err = 4;
+        else if (e2) active_err = 2;
+        else if (e3) active_err = 3;
+
+        /* Advance the wall-clock error blink.
+         * While any status-bar animation plays, blink is frozen at false so errors
+         * cannot bleed through.  Timer resets at animation end → first thing shown is
+         * always the normal status (ПАУЗА/РАБОТА/…), then alternate every 500 ms. */
+        {
+            bool any_status_anim = is_loading || is_purging || is_ramping || is_connecting;
+            if (any_status_anim) {
+                err_blink_on        = false;
+                err_blink_toggle_ms = bc_now;
+            } else if (active_err != 0) {
+                if ((bc_now - err_blink_toggle_ms) >= ERR_BLINK_HALF_MS) {
+                    err_blink_on        = !err_blink_on;
+                    err_blink_toggle_ms += ERR_BLINK_HALF_MS;
+                    /* Guard against lag accumulation */
+                    if ((bc_now - err_blink_toggle_ms) >= ERR_BLINK_HALF_MS)
+                        err_blink_toggle_ms = bc_now;
+                }
+            } else {
+                /* No active error — reset timer so it's fresh when error appears */
+                err_blink_on        = false;
+                err_blink_toggle_ms = bc_now;
+            }
+        }
+
+        /* Waiting-for-target-temps: explicit flag from app (command TW) */
+        bool waiting_for_temps = g_waiting_for_temps;
+
+        /* Advance marquee scroll offset when waiting */
+        if (waiting_for_temps) {
+            if (!prev_waiting_for_temps) { wait_scroll_px = 0; wait_scroll_ms = bc_now; }
+            if ((bc_now - wait_scroll_ms) >= WAIT_SCROLL_PERIOD_MS) {
+                wait_scroll_px++;
+                wait_scroll_ms += WAIT_SCROLL_PERIOD_MS;
+                if ((bc_now - wait_scroll_ms) >= WAIT_SCROLL_PERIOD_MS) wait_scroll_ms = bc_now;
+            }
+        } else {
+            wait_scroll_px = 0;
+        }
+        prev_waiting_for_temps = waiting_for_temps;
+
+        /* Advance hydroline-disconnected marquee scroll offset */
+        if (e5) {
+            if (!prev_hydro_active) { hydro_scroll_px = 0; hydro_scroll_ms = bc_now; }
+            if ((bc_now - hydro_scroll_ms) >= HYDRO_SCROLL_PERIOD_MS) {
+                hydro_scroll_px++;
+                hydro_scroll_ms += HYDRO_SCROLL_PERIOD_MS;
+                if ((bc_now - hydro_scroll_ms) >= HYDRO_SCROLL_PERIOD_MS) hydro_scroll_ms = bc_now;
+            }
+        } else {
+            hydro_scroll_px = 0;
+        }
+        prev_hydro_active = e5;
+
+        if (is_loading) {
+            /* ЗАГРУЗКА letter-by-letter: 2 cycles × 11 frames × 94 ms ≈ 2.1 s.
+             * Frames 0..7: reveal 1 new letter per frame (8 letters total).
+             * Frames 8..10: pause, all 8 letters shown. */
+            const char* load_word = g_display_lang ? "LOADING" : "ЗАГРУЗКА";
+            int load_word_len = g_display_lang ? 7 : 8;
+            int cycle_frame = load_frame % 11;
+            int revealed_letters = (cycle_frame < load_word_len) ? cycle_frame + 1 : load_word_len;
+
+            const int word_px = load_word_len * 6;
+            int wx = (64 - word_px) / 2;  /* =8 */
+
+            const char* wp = load_word;
+            int xpos = wx;
+            for (int li = 0; li < revealed_letters; li++) {
+                uint16_t lcp = utf8_next_cp(&wp);
+                if (lcp == 0) break;
+                int lnc = 5;
+                const uint8_t* lg = font_wide_get((int)lcp, &lnc);
+                if (!lg) lg = font5x7_get((int)lcp);
+                for (int dc = 0; dc < lnc; dc++) {
+                    uint8_t lcol = lg[dc];
+                    for (int dr = 0; dr < 8; dr++) {
+                        if ((lcol >> dr) & 1u)
+                            oled_fb_set_pixel(xpos + dc, ico_y + dr, true);
+                    }
+                }
+                xpos += lnc + 1;
+            }
+        } else if (is_purging) {
+            /* ПРОДУВКА letter-by-letter, loops while purge is active.
+             * 8 letters: frames 0..7 reveal, frames 8..10 pause, then repeats.
+             * 125 ms/frame → 11 * 125 = 1.375 s per cycle. */
+            const char* purge_word = g_display_lang ? "PURGING" : "ПРОДУВКА";
+            int purge_word_len = g_display_lang ? 7 : 8;
+            int prel   = load_frame - purge_frame_base;
+            int pcycle = prel % 11;
+            int purge_revealed = (pcycle < purge_word_len) ? pcycle + 1 : purge_word_len;
+
+            const int purge_px = purge_word_len * 6;
+            int pwx = (64 - purge_px) / 2;    /* =8 */
+
+            const char* pwp = purge_word;
+            int pxpos = pwx;
+            for (int li = 0; li < purge_revealed; li++) {
+                uint16_t lcp = utf8_next_cp(&pwp);
+                if (lcp == 0) break;
+                int lnc = 5;
+                const uint8_t* lg = font_wide_get((int)lcp, &lnc);
+                if (!lg) lg = font5x7_get((int)lcp);
+                for (int dc = 0; dc < lnc; dc++) {
+                    uint8_t lcol = lg[dc];
+                    for (int dr = 0; dr < 8; dr++) {
+                        if ((lcol >> dr) & 1u)
+                            oled_fb_set_pixel(pxpos + dc, ico_y + dr, true);
+                    }
+                }
+                pxpos += lnc + 1;
+            }
+        } else if (is_ramping) {
+            /* НАПОЛНЯЮ letter-by-letter, show during the short valve PWM ramp.
+             * 8 letters: frames 0..7 reveal, frames 8..10 pause, then repeats. */
+            const char* ramp_word = g_display_lang ? "FILLING" : "НАПОЛНЯЮ";
+            int ramp_word_len = g_display_lang ? 7 : 8;
+            int rrel   = load_frame - ramp_frame_base;
+            int rcycle = rrel % 11;
+            int ramp_revealed = (rcycle < ramp_word_len) ? rcycle + 1 : ramp_word_len;
+
+            const int ramp_px = ramp_word_len * 6;
+            int rwx = (64 - ramp_px) / 2;    /* =8 */
+
+            const char* rwp = ramp_word;
+            int rxpos = rwx;
+            for (int li = 0; li < ramp_revealed; li++) {
+                uint16_t lcp = utf8_next_cp(&rwp);
+                if (lcp == 0) break;
+                int lnc = 5;
+                const uint8_t* lg = font_wide_get((int)lcp, &lnc);
+                if (!lg) lg = font5x7_get((int)lcp);
+                for (int dc = 0; dc < lnc; dc++) {
+                    uint8_t lcol = lg[dc];
+                    for (int dr = 0; dr < 8; dr++) {
+                        if ((lcol >> dr) & 1u)
+                            oled_fb_set_pixel(rxpos + dc, ico_y + dr, true);
+                    }
+                }
+                rxpos += lnc + 1;
+            }
+        } else if (is_connecting) {
+            /* ПОДКЛЮЧАЮ letter-by-letter, 2 cycles.
+             * rel_frame is relative to connection moment → always starts from letter 1.
+             * Frames 0..8: reveal 1 new letter per frame (9 letters).
+             * Frames 9..10: pause, all 9 letters shown. 2 × 11 × 125 ms ≈ 2.75 s. */
+            const char* conn_word = g_display_lang ? "CONNECT" : "ПОДКЛЮЧАЮ";
+            int conn_word_len = g_display_lang ? 7 : 9;
+            int rel_frame  = load_frame - conn_frame_base;
+            int ccycle     = rel_frame % 11;
+            int conn_revealed = (ccycle < conn_word_len) ? ccycle + 1 : conn_word_len;
+
+            const int conn_px = conn_word_len * 6;
+            int cwx = (64 - conn_px) / 2;    /* =5 */
+
+            const char* cwp = conn_word;
+            int cxpos = cwx;
+            for (int li = 0; li < conn_revealed; li++) {
+                uint16_t lcp = utf8_next_cp(&cwp);
+                if (lcp == 0) break;
+                int lnc = 5;
+                const uint8_t* lg = font_wide_get((int)lcp, &lnc);
+                if (!lg) lg = font5x7_get((int)lcp);
+                for (int dc = 0; dc < lnc; dc++) {
+                    uint8_t lcol = lg[dc];
+                    for (int dr = 0; dr < 8; dr++) {
+                        if ((lcol >> dr) & 1u)
+                            oled_fb_set_pixel(cxpos + dc, ico_y + dr, true);
+                    }
+                }
+                cxpos += lnc + 1;
+            }
+        } else if (e5) {
+            /* HYDROLINE DISCONNECTED: pixel-marquee "подключите гидролинии".
+             * Highest priority among status messages — no alternation.
+             * If connected, show connection icon on the left (same as waiting_for_temps). */
+            const char* hydro_str = g_display_lang ? "CONNECT HYDROLINES" : "ПОДКЛЮЧИТЕ ГИДРОЛИНИИ";
+            int hydro_px    = text_px_width(hydro_str);
+            int hydro_gap   = 20;
+            int hydro_cycle = hydro_px + hydro_gap;
+
+            if (ble_on || usb_on) {
+                const char* conn_txt = NULL;
+                const uint8_t* conn_icon = NULL;
+                if (ble_on) { conn_txt = g_display_lang ? "BT" : "БТ"; conn_icon = ico_bt; }
+                else        { conn_txt = g_display_lang ? "USB" : "ЮСБ"; conn_icon = ico_usb; }
+                int conn_w    = text_px_width(conn_txt);
+                int left_zone = 5 + 2 + conn_w + 3;
+                int x0 = left_zone - (hydro_scroll_px % hydro_cycle);
+                oled_draw_text(x0,              ico_y, hydro_str);
+                oled_draw_text(x0 + hydro_cycle, ico_y, hydro_str);
+                oled_fb_fill_rect(0, ico_y, left_zone, 8, false);
+                DRAW_ICON(0, ico_y, conn_icon, 1);
+                oled_draw_text(5 + 2, ico_y, conn_txt);
+            } else {
+                int x0 = -(hydro_scroll_px % hydro_cycle);
+                oled_draw_text(x0,              ico_y, hydro_str);
+                oled_draw_text(x0 + hydro_cycle, ico_y, hydro_str);
+            }
+        } else if (active_err != 0 && err_blink_on) {
+            /* Error state (non-loop errors; loop broken handled above as marquee).
+             * err_blink_on half (500 ms): show ⚠ icon + error text.
+             * err_blink_on=false half falls through to normal status (ПАУЗА/РАБОТА/etc.) */
+            char etxt[20];
+            const char* ebase = g_display_lang ? "ERROR " : "ОШИБКА ";
+            int ebi = 0; const char* ep = ebase;
+            while (*ep) etxt[ebi++] = *ep++;
+            etxt[ebi++] = '0' + (char)active_err;
+            etxt[ebi] = '\0';
+            int etxt_chlen = g_display_lang ? 8 : 8;
+            int etxt_w = etxt_chlen * 6;
+            /* Small warning icon: ico_warn (5px wide) + 2px gap + text, centred */
+            int total_err_w = 5 + 2 + etxt_w;
+            int ex = (64 - total_err_w) / 2;
+            if (ex < 0) ex = 0;
+            DRAW_ICON(ex, ico_y, ico_warn, 1);
+            oled_draw_text(ex + 5 + 2, ico_y, etxt);
+        } else if (g_loopprot_enabled && g_loop_ok && g_lp_restore_ms != 0 &&
+                   !g_system_running && g_was_running_before_loop_break) {
+            /* Loop restored — countdown before rearm. "ПУСК N" in one line.
+             * Show only if system WAS running before the loop broke;
+             * if user was on pause, skip countdown silently. */
+            int secs_left = LP_REARM_SECS - (int)((bc_now - g_lp_restore_ms) / 1000u);
+            if (secs_left < 1) secs_left = 1;
+            /* "ПУСК " (5 chars) + digit (1 char) = 6 × 6px = 36px, centred */
+            char cntd[16];
+            const char* pusk = g_display_lang ? "START " : "ПУСК ";
+            int pusk_chlen = g_display_lang ? 6 : 5;
+            int ci = 0; const char* cp = pusk;
+            while (*cp) cntd[ci++] = *cp++;
+            cntd[ci++] = '0' + (char)secs_left;
+            cntd[ci] = '\0';
+            int cntd_w = (pusk_chlen + 1) * 6;
+            oled_draw_text((64 - cntd_w) / 2, ico_y, cntd);
+        } else {
+            /* Connection-first logic:
+             * - If no connection -> show "ГОТОВ"
+             * - Else (there is connection) -> show "ПАУЗА" or "РАБОТА" with conn icon/text
+             */
+            if (!ble_on && !usb_on) {
+                /* No connection: icon + "READY"/"ГОТОВ" centred */
+                const char* rtxt = g_display_lang ? "READY" : "ГОТОВ";
+                int rtxt_w = text_px_width(rtxt);
+                int total_w = 5 + 2 + rtxt_w;
+                int rx = (64 - total_w) / 2;
+                DRAW_ICON(rx, ico_y, ico_rdy, 1);
+                oled_draw_text(rx + 7, ico_y, rtxt);
+            } else {
+                /* There is a connection: draw PAUSE or WORK with connection icon/text */
+                const char* conn_txt = NULL;
+                const uint8_t* conn_icon = NULL;
+                if (ble_on) { conn_txt = g_display_lang ? "BT" : "БТ"; conn_icon = ico_bt; }
+                else if (usb_on) { conn_txt = g_display_lang ? "USB" : "ЮСБ"; conn_icon = ico_usb; }
+                int conn_w = conn_txt ? text_px_width(conn_txt) : 0;
+
+                if (!g_system_running ||
+                    (purge_ended_ms != 0 && (bc_now - purge_ended_ms) < PURGE_WORK_SUPPRESS_MS)) {
+                    /* PAUSE: static label, show connection type next to it (no animation)
+                     * Layout: [ICON][2px gap][CONN_TEXT][2px gap]["ПАУЗА"] or just "ПАУЗА" if no conn */
+                    const char* ptxt = g_display_lang ? "PAUSE" : "ПАУЗА";
+                    int ptxt_w = text_px_width(ptxt);
+                    int total_w = conn_txt ? (5 + 2 + conn_w + 2 + ptxt_w) : ptxt_w;
+                    int px = (64 - total_w) / 2;
+                    if (px < 0) px = 0;
+
+                    if (conn_txt) {
+                        DRAW_ICON(px, ico_y, conn_icon, 1);
+                        oled_draw_text(px + 5 + 2, ico_y, conn_txt);
+                        oled_draw_text(px + 5 + 2 + conn_w + 2, ico_y, ptxt);
+                    } else {
+                        oled_draw_text(px, ico_y, ptxt);
+                    }
+                } else if (waiting_for_temps) {
+                    /* WAITING FOR TARGET TEMPS: pixel-marquee scrolling text.
+                     * Left zone: [ICON 5px][2px][CONN_TEXT][3px gap]  — static, drawn ON TOP of scroll.
+                     * Scroll zone: everything to the right of left zone. */
+                    const char* wt_str   = g_display_lang ? "WAITING TARGETS" : "ОЖИДАЮ ЦЕЛЕВЫЕ ТЕМПЕРАТУРЫ";
+                    int wt_px            = text_px_width(wt_str);
+                    int wt_gap           = 20;                    /* inter-copy gap for seamless wrap */
+                    int wt_cycle         = wt_px + wt_gap;
+                    /* Left static zone width: icon(5) + gap(2) + conn_text + padding(3) */
+                    int left_zone = 5 + 2 + conn_w + 3;
+                    /* Draw scrolling text first (may overlap left zone) */
+                    int x0 = left_zone - (wait_scroll_px % wt_cycle);
+                    oled_draw_text(x0,            ico_y, wt_str);
+                    oled_draw_text(x0 + wt_cycle, ico_y, wt_str);
+                    /* Clear left zone to black, then draw icon + label on top */
+                    oled_fb_fill_rect(0, ico_y, left_zone, 8, false);
+                    DRAW_ICON(0, ico_y, conn_icon, 1);
+                    oled_draw_text(5 + 2, ico_y, conn_txt);
+                } else {
+                    /* WORK: static label, show connection type next to it (no animation)
+                     * Layout: [ICON][2px gap][CONN_TEXT][2px gap]["РАБОТА"] or just "РАБОТА" if no conn */
+                    const char* wtxt = g_display_lang ? "ACTIVE" : "РАБОТА";
+                    int wtxt_w = text_px_width(wtxt);
+                    int total_w_w = conn_txt ? (5 + 2 + conn_w + 2 + wtxt_w) : wtxt_w;
+                    int pxw = (64 - total_w_w) / 2;
+                    if (pxw < 0) pxw = 0;
+
+                    if (conn_txt) {
+                        DRAW_ICON(pxw, ico_y, conn_icon, 1);
+                        oled_draw_text(pxw + 5 + 2, ico_y, conn_txt);
+                        oled_draw_text(pxw + 5 + 2 + conn_w + 2, ico_y, wtxt);
+                    } else {
+                        oled_draw_text(pxw, ico_y, wtxt);
+                    }
+                }
+            }
+        }
+
+        /* Advance load_frame every 94 ms by wall-clock, independent of loop speed.
+         * This keeps ЗАГРУЗКА letter reveal rate constant even when the loop runs at 20 ms. */
+        {
+            uint32_t lf_now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            uint32_t lf_period = is_purging ? 125u : (is_connecting ? 125u : (is_ramping ? 62u : 94u));
+            if ((lf_now - last_load_frame_ms) >= lf_period) {
+                load_frame++;
+                last_load_frame_ms += lf_period;
+            }
+        }
+
+        oled_flush();
+        /* During boot digit countdown or loading: refresh at 20 ms so every digit value
+         * (99,98,97...) is rendered in its own frame. load_frame still advances at 94 ms
+         * so ЗАГРУЗКА animation speed is unaffected. */
+        /* Priority: boot/loading → 20 ms; purging → 125 ms; connecting → 125 ms
+         * (is_connecting takes priority over is_conn_anim so ПОДКЛЮЧАЮ speed is stable);
+         * digit connect-in anim → 20 ms; ramping → 62 ms; idle → 500 ms. */
+        vTaskDelay(pdMS_TO_TICKS((is_loading || is_boot_countdown) ? 20 : (is_purging ? 125 : (is_connecting ? 125 : (is_conn_anim ? 20 : (is_ramping ? 62 : ((e5 || waiting_for_temps) ? 20 : 500)))))));
     }
+
+    #undef DRAW_CHAR_S
+    #undef DRAW_TEXT_S
+    #undef DRAW_INT_S
+    #undef DRAW_INT_ZP_S
+    #undef DRAW_ICON
+    #undef ERR_BLINK_HALF_MS
+    #undef CONNECTING_SHOW_MS
+    #undef PURGE_WORK_SUPPRESS_MS
 }
 
 /* ===== Valve (solenoid) control ===== */
@@ -2821,15 +4273,17 @@ static void valve_pwm_init(void){
 #if defined(GPIO_PULLDOWN_ENABLE) || defined(gpio_pulldown_en)
     gpio_pulldown_en((gpio_num_t)VALVE_GPIO);
 #endif
-    /* Configure dedicated LEDC timer/channel for the valve to allow high-frequency PWM */
-    ledc_timer_config_t t_valve={ .speed_mode=LEDC_LOW_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
+    /* Configure dedicated LEDC timer/channel for the valve */
+    ledc_timer_config_t t_valve={ .speed_mode=LEDC_HIGH_SPEED_MODE, .duty_resolution=LEDC_TIMER_RES,
                                   .timer_num=LEDC_TIMER_2, .freq_hz=LEDC_VALVE_FREQ_HZ, .clk_cfg=LEDC_AUTO_CLK };
-    ESP_ERROR_CHECK(ledc_timer_config(&t_valve));
-    ledc_channel_config_t c_valve={ .gpio_num=VALVE_GPIO, .speed_mode=LEDC_LOW_SPEED_MODE,
+    esp_err_t err = ledc_timer_config(&t_valve);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "VALVE: timer_config err=%s", esp_err_to_name(err)); return; }
+    ledc_channel_config_t c_valve={ .gpio_num=VALVE_GPIO, .speed_mode=LEDC_HIGH_SPEED_MODE,
                                     .channel=LEDC_CHANNEL_2, .intr_type=LEDC_INTR_DISABLE,
                                     .timer_sel=LEDC_TIMER_2, .duty=0, .hpoint=0 };
-    ESP_ERROR_CHECK(ledc_channel_config(&c_valve));
-    ESP_ERROR_CHECK(ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0));
+    err = ledc_channel_config(&c_valve);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "VALVE: channel_config err=%s", esp_err_to_name(err)); return; }
+    (void)ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, 0);
     g_pwm_valve_attached = true;
 }
 
@@ -2838,20 +4292,27 @@ static void valve_pwm_set_percent(float pct){
     if (!g_pwm_valve_attached){
         valve_pwm_init();
     }
-    uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-    if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
-        return;
+    /* Во время продувки forced-stop НЕ блокирует клапан */
+    if (!g_purge_active){
+        uint32_t now_ms_local = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
+        if (g_forced_stop_deadline_ms && now_ms_local < g_forced_stop_deadline_ms){
+            ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, 0);
+            return;
+        }
     }
     if (p <= 0.0f){
         /* fully open to water (inactive) */
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+        ledc_stop(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, 0);
         return;
     }
-    ESP_ERROR_CHECK(ledc_timer_resume(LEDC_LOW_SPEED_MODE, LEDC_TIMER_2));
+    esp_err_t err;
+    err = ledc_timer_resume(LEDC_HIGH_SPEED_MODE, LEDC_TIMER_2);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "VALVE: timer_resume err=%s", esp_err_to_name(err)); return; }
     uint32_t duty=(uint32_t)lroundf((p/100.0f)*LEDC_DUTY_MAX);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2));
+    err = ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2, duty);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "VALVE: set_duty err=%s", esp_err_to_name(err)); return; }
+    err = ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_2);
+    if (err != ESP_OK) { ESP_LOGW(TAG, "VALVE: update_duty err=%s", esp_err_to_name(err)); }
 }
 
 /* ===== Loop protection monitor ===== */
@@ -2872,7 +4333,10 @@ static void loopprot_task(void *arg){
         if (++win >= 10){
             if (edges <= 1){
                 if (g_loop_ok){
-                    g_loop_ok = false; ESP_LOGW(TAG, "LOOP: broken");
+                    g_loop_ok = false;
+                    g_lp_restore_ms = 0;   /* cancel any rearm countdown */
+                    g_was_running_before_loop_break = g_system_running; /* remember if user was in РАБОТА */
+                    ESP_LOGW(TAG, "LOOP: broken (was_running=%d)", (int)g_was_running_before_loop_break);
                     /* notify clients about status change */
                     #if CONFIG_BT_NIMBLE_ENABLED
                     if (g_ble_connected && g_loop_stat_val_handle){
@@ -2884,40 +4348,86 @@ static void loopprot_task(void *arg){
                         }
                     }
                     #endif
+                    /* UART parity: send loop status over USB too */
+                    if (g_usb_connected) {
+                        uart_send_ls(g_loopprot_enabled ? 2 : 0);
+                    }
                     if (g_loopprot_enabled){
-                        /* Force immediate STOP similar to 'SP' */
+                        /* Defer heavy STOP to control_task (avoid stack overflow here) */
                         g_system_running = false;
-                        fan_pwm_set_percent(0.0f);
-                        pump_pwm_set_percent(0.0f);
-                        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-                        (void)ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-                        gpio_set_direction((gpio_num_t)FAN_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)FAN_PWM_GPIO, 0);
-                        gpio_set_direction((gpio_num_t)PUMP_PWM_GPIO, GPIO_MODE_OUTPUT); gpio_set_level((gpio_num_t)PUMP_PWM_GPIO, 0);
-                        g_pwm_fan_attached = false; g_pwm_pump_attached = false;
-                        uint32_t now_ms = (uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-                        g_forced_stop_deadline_ms = now_ms + 1500u;
-                        g_pump_boost_active = false;
+                        g_stop_pending = true;
+                        g_pump_boost_armed  = false; /* prevent stale boost on auto-rearm */
                         if (g_purge_active) purge_stop();
                     }
                 }
             } else if (edges >= 8){
                 if (!g_loop_ok){
-                    g_loop_ok = true; ESP_LOGI(TAG, "LOOP: restored");
-                    /* notify clients about status change */
+                    g_loop_ok = true;
+                    g_lp_restore_ms = g_was_running_before_loop_break
+                                      ? (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS)
+                                      : 0; /* no countdown if user was on pause */
+                    ESP_LOGI(TAG, "LOOP: restored (was_running=%d), rearm %s",
+                             (int)g_was_running_before_loop_break,
+                             g_lp_restore_ms ? "countdown" : "skip");
+                    /* notify clients about status change.
+                     * code 3 = loop restored AND system was running before break
+                     *           (tells app to auto-start with countdown)
+                     * code 1 = loop restored, system was on pause (no auto-start) */
                     #if CONFIG_BT_NIMBLE_ENABLED
                     if (g_ble_connected && g_loop_stat_val_handle){
-                        uint8_t code = g_loopprot_enabled ? 1 : 0;
+                        uint8_t code;
+                        if (!g_loopprot_enabled) code = 0;
+                        else code = g_was_running_before_loop_break ? 3 : 1;
                         struct os_mbuf* om = ble_hs_mbuf_from_flat(&code, 1);
                         if (om) {
                             int rc = ble_gatts_notify_custom(g_conn_handle, g_loop_stat_val_handle, om);
-                            if (rc != 0) ESP_LOGW(TAG, "LOOP notify(restored) rc=%d", rc);
+                            if (rc != 0) ESP_LOGW(TAG, "LOOP notify(restored) rc=%d code=%d", rc, (int)code);
                         }
                     }
                     #endif
+                    /* UART parity: send loop status over USB too */
+                    if (g_usb_connected) {
+                        uint8_t code;
+                        if (!g_loopprot_enabled) code = 0;
+                        else code = g_was_running_before_loop_break ? 3 : 1;
+                        uart_send_ls(code);
+                    }
                 }
             }
             win = 0; edges = 0;
         }
+
+        /* Auto-rearm: after LP_REARM_SECS, restart system if it was running before loop broke */
+        if (g_lp_restore_ms != 0 && g_loop_ok && g_was_running_before_loop_break && !g_system_running) {
+            uint32_t elapsed = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - g_lp_restore_ms;
+            if (elapsed >= (uint32_t)(LP_REARM_SECS * 1000)) {
+                ESP_LOGI(TAG, "LOOP: auto-rearm after %d s", LP_REARM_SECS);
+                g_fan_last_filt = NAN; g_pump_last_filt = NAN;
+                g_fan_last_appl = NAN; g_pump_last_appl = 0.0f;
+                /* NOTE: do NOT set g_start_pending here — it triggers NVS boost
+                 * check in control_task, causing unwanted RAMP after loop restore.
+                 * Boost/RAMP should only happen after purge → SP → ST sequence. */
+                g_lp_restore_ms = 0;
+                g_was_running_before_loop_break = false;
+                g_system_running = true;
+                /* Notify app that auto-rearm completed: code 4 = "system auto-started".
+                 * App should force its button to РАБОТА immediately (no own countdown). */
+                #if CONFIG_BT_NIMBLE_ENABLED
+                if (g_ble_connected && g_loop_stat_val_handle){
+                    uint8_t code = 4;
+                    struct os_mbuf* om = ble_hs_mbuf_from_flat(&code, 1);
+                    if (om) {
+                        int rc = ble_gatts_notify_custom(g_conn_handle, g_loop_stat_val_handle, om);
+                        if (rc != 0) ESP_LOGW(TAG, "LOOP notify(auto-rearm) rc=%d", rc);
+                    }
+                }
+                #endif
+                if (g_usb_connected) {
+                    uart_send_ls(4);
+                }
+            }
+        }
+
         vTaskDelayUntil(&last, step);
     }
 }

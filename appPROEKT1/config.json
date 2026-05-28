@@ -1,0 +1,47 @@
+{
+  "autostart": false,
+  "minimized": false,
+  "keep_led_on_disconnected": false,
+  "loop_protection": true,
+  "purge_on_shutdown": true,
+  "brightness": 13,
+  "transport": "BLE",
+  "led_profiles": {
+    "Текущий": {
+      "mode": "Моно градиентный",
+      "colors": [
+        [
+          17,
+          0,
+          255
+        ],
+        [
+          255,
+          0,
+          47
+        ]
+      ],
+      "speed": 2,
+      "points": [
+        [
+          [
+            544,
+            8
+          ]
+        ],
+        [
+          [
+            776,
+            175
+          ]
+        ]
+      ]
+    }
+  },
+  "oled_brightness": 6,
+  "delay_on_seconds": 0,
+  "delay_off_seconds": 0,
+  "app_language": "RU",
+  "display_lang": "RU",
+  "theme": "graphite"
+}

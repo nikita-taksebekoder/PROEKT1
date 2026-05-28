@@ -1,0 +1,12 @@
+{
+  "file": "..\\..\\AppData\\Local\\Programs\\Microsoft VS Code\\tests\\test_main.py",
+  "timestamp": "2026-01-27T15-25-36-707Z",
+  "prompt": "привет\n",
+  "originalContent": null,
+  "generatedCode": "\"\"\"\nUnit tests for src.main.\n\nUses Python's built‑in unittest framework.\n\"\"\"\n\nimport unittest\n\nfrom src import main\n\n\nclass TestGreet(unittest.TestCase):\n    def test_greet_returns_correct_string(self):\n        self.assertEqual(\n            main.greet(\"Alice\"),\n            \"Hello, Alice! Welcome to the none project.\"\n        )\n\n    def test_greet_with_empty_name(self):\n        # Even an empty name should not break the function\n        self.assertEqual(\n            main.greet(\"\"),\n            \"Hello, ! Welcome to the none project.\"\n        )\n\n\nif __name__ == \"__main__\":\n    unittest.main()",
+  "metadata": {
+    "fileExisted": false,
+    "filePath": "..\\..\\AppData\\Local\\Programs\\Microsoft VS Code\\tests\\test_main.py",
+    "logPath": "ignorelogs\\2026-01-27T15-25-36-707Z_test_main.json"
+  }
+}
