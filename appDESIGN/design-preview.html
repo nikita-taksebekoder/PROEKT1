@@ -5,8 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PROEKT1 — Design Preview</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-
   :root { --card-bg: rgba(14,16,40,0.65); }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -738,8 +736,7 @@
     inset: 0;
     border-radius: inherit;
     pointer-events: none;
-    opacity: 0.18;
-    mix-blend-mode: soft-light;
+    opacity: 0.12;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.70' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23g)'/%3E%3C/svg%3E");
     background-size: 160px 160px;
   }
@@ -897,6 +894,8 @@
       rgba(0,0,0,0.13);
     background-size: 42px 42px;
     cursor: none;
+    isolation: isolate;
+    contain: layout style;
   }
   .curve-plot.is-dragging {
     cursor: grabbing;
@@ -910,18 +909,17 @@
     border-radius: 50%;
     pointer-events: none;
     opacity: 0;
-    transform: translate3d(var(--curve-x, 0px), var(--curve-y, 0px), 0) translate(-50%, -50%);
-    will-change: transform, opacity;
+    transform: translate(-50%, -50%);
     z-index: 4;
-    transition: opacity .1s ease;
+    transition: none;
   }
   .curve-cursor-dot.is-pump {
     background: rgba(139,213,255,0.92);
-    animation: cursor-pulse-pump 1.5s ease-in-out infinite;
+    box-shadow: 0 0 12px 3px rgba(139,213,255,0.55);
   }
   .curve-cursor-dot.is-fan {
     background: rgba(255,133,194,0.9);
-    animation: cursor-pulse-fan 1.5s ease-in-out infinite;
+    box-shadow: 0 0 12px 3px rgba(255,133,194,0.52);
   }
   .curve-cursor-dot.is-visible { opacity: 1; }
   .curve-cursor-label {
@@ -929,8 +927,7 @@
     left: 0;
     top: 0;
     pointer-events: none;
-    transform: translate3d(var(--curve-x, 0px), var(--curve-y, 0px), 0) translate(-50%, -100%);
-    will-change: transform, opacity;
+    transform: translate(-50%, -100%);
     opacity: 0;
     z-index: 4;
     font-family: "JetBrains Mono", "Consolas", monospace;
@@ -938,18 +935,18 @@
     font-weight: 700;
     white-space: nowrap;
     text-shadow: 0 1px 6px rgba(0,0,0,0.8);
-    transition: opacity .1s ease;
+    transition: none;
   }
   .curve-cursor-label.is-pump { color: rgba(139,213,255,0.82); }
   .curve-cursor-label.is-fan  { color: rgba(255,133,194,0.82); }
   .curve-cursor-label.is-visible { opacity: 1; }
-  @keyframes cursor-pulse-pump {
-    0%, 100% { box-shadow: 0 0 6px 2px rgba(139,213,255,0.52); }
-    50%       { box-shadow: 0 0 16px 7px rgba(139,213,255,0.90); }
-  }
-  @keyframes cursor-pulse-fan {
-    0%, 100% { box-shadow: 0 0 6px 2px rgba(255,133,194,0.50); }
-    50%       { box-shadow: 0 0 16px 7px rgba(255,133,194,0.88); }
+  .curve-hover-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 4;
   }
   .curve-y-axis {
     position: absolute;
@@ -974,6 +971,7 @@
     width: calc(100% - 96px);
     height: calc(100% - 78px);
     overflow: visible;
+    pointer-events: none;
   }
   .curve-path {
     fill: none;
@@ -981,7 +979,7 @@
     stroke-linecap: round;
     stroke-linejoin: round;
     opacity: 0.78;
-    transition: opacity .14s ease, stroke-width .14s ease, filter .14s ease;
+    transition: opacity .14s ease, stroke-width .14s ease;
   }
   .curve-path.is-active {
     opacity: 0.98;
@@ -993,11 +991,9 @@
   }
   .curve-path-pump {
     stroke: #8bd5ff;
-    filter: drop-shadow(0 0 7px rgba(139,213,255,0.34));
   }
   .curve-path-fan {
     stroke: #ff85c2;
-    filter: drop-shadow(0 0 7px rgba(255,133,194,0.34));
   }
   .curve-preview-path {
     fill: none;
@@ -1008,41 +1004,34 @@
     stroke-dashoffset: 0;
     opacity: 0;
     pointer-events: none;
-    animation: curve-preview-flow .82s linear infinite;
-    transition: opacity .12s ease;
+    transition: none;
   }
   .curve-plot.is-previewing .curve-preview-path {
     opacity: 0.96;
-    animation: none;
-    filter: none;
     transition: none;
   }
   .curve-preview-pump {
     stroke: rgba(139,213,255,0.98);
-    filter: drop-shadow(0 0 8px rgba(139,213,255,0.52));
   }
   .curve-preview-fan {
     stroke: rgba(255,133,194,0.98);
-    filter: drop-shadow(0 0 8px rgba(255,133,194,0.48));
   }
   .curve-plot.is-dragging .curve-path,
-  .curve-plot.is-dragging .curve-point { filter: none; transition: none; }
-  .curve-plot.is-previewing .curve-cursor-dot { animation: none; }
-  @keyframes curve-preview-flow { to { stroke-dashoffset: -32; } }
+  .curve-plot.is-dragging .curve-point,
+  .curve-plot.is-hovering .curve-path,
+  .curve-plot.is-hovering .curve-point { transition: none; }
   .curve-point {
     stroke-width: 2.8;
-    cursor: pointer;
-    transition: opacity .12s ease, r .12s ease, stroke-width .12s ease, stroke .12s ease, filter .12s ease;
+    pointer-events: none;
+    transition: opacity .12s ease, r .12s ease, stroke-width .12s ease, stroke .12s ease;
   }
   .curve-point-pump {
     fill: rgba(139,213,255,0.86);
     stroke: rgba(139,213,255,0.72);
-    filter: drop-shadow(0 0 5px rgba(139,213,255,0.46));
   }
   .curve-point-fan {
     fill: rgba(255,133,194,0.84);
     stroke: rgba(255,133,194,0.72);
-    filter: drop-shadow(0 0 5px rgba(255,133,194,0.42));
   }
   .curve-point.is-muted {
     opacity: 0.36;
@@ -1054,11 +1043,9 @@
   }
   .curve-point-pump.is-selected {
     stroke: rgba(139,213,255,0.94);
-    filter: drop-shadow(0 0 8px rgba(139,213,255,0.72));
   }
   .curve-point-fan.is-selected {
     stroke: rgba(255,133,194,0.94);
-    filter: drop-shadow(0 0 8px rgba(255,133,194,0.66));
   }
   .curve-x-axis {
     display: flex;
@@ -1082,7 +1069,6 @@
     left: 0;
     top: 0;
     transform: none;
-    will-change: opacity;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1138,8 +1124,6 @@
     font-weight: 700;
     text-shadow: 0 1px 8px rgba(0,0,0,0.42);
     box-shadow: 0 16px 36px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.18);
-    -webkit-backdrop-filter: blur(14px) saturate(150%);
-    backdrop-filter: blur(14px) saturate(150%);
   }
   .curve-tooltip-value::before {
     content: "";
@@ -1150,7 +1134,6 @@
     pointer-events: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='72' height='72' viewBox='0 0 72 72'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='72' height='72' filter='url(%23n)' opacity='.72'/%3E%3C/svg%3E");
     background-size: 72px 72px;
-    mix-blend-mode: soft-light;
   }
   .curve-tooltip.is-fan .curve-tooltip-value {
     color: #ff85c2;
@@ -1619,14 +1602,14 @@
   :-webkit-full-screen .app-window {
     left: 50% !important;
     top: 50% !important;
-    transform: translate(-50%, -50%) scale(1.2) !important;
+    transform: translate(-50%, -50%) !important;
     transition: transform 0.25s ease !important;
   }
   /* CSS-фоллбэк (если :fullscreen не поддерживается) */
   body.fullscreen .app-window {
     left: 50% !important;
     top: 50% !important;
-    transform: translate(-50%, -50%) scale(1.2) !important;
+    transform: translate(-50%, -50%) !important;
     transition: transform 0.25s ease !important;
   }
 </style>
@@ -1909,6 +1892,7 @@
                   </g>
                 </g>
               </svg>
+              <canvas class="curve-hover-canvas" id="curve-hover-canvas" aria-hidden="true"></canvas>
               <div class="curve-cursor-dot" id="curve-cursor-dot" aria-hidden="true"></div>
               <div class="curve-cursor-label" id="curve-cursor-label" aria-hidden="true"></div>
               <div class="curve-tooltip" id="curve-tooltip">
@@ -2155,16 +2139,16 @@
                 <div class="set-slider-row">
                   <div class="set-slider-head">
                     <span class="set-row-label">Яркость подсветки</span>
-                    <span class="set-slider-val" data-out="led-val">255</span>
+                    <span class="set-slider-val" data-out="led-val">100%</span>
                   </div>
-                  <input type="range" class="set-range" min="0" max="255" value="255" data-target="led-val">
+                  <input type="range" class="set-range" min="0" max="100" value="100" data-target="led-val">
                 </div>
                 <div class="set-slider-row">
                   <div class="set-slider-head">
                     <span class="set-row-label">Яркость OLED-экрана</span>
-                    <span class="set-slider-val" data-out="oled-val">207</span>
+                    <span class="set-slider-val" data-out="oled-val">81%</span>
                   </div>
-                  <input type="range" class="set-range" min="0" max="255" value="207" data-target="oled-val">
+                  <input type="range" class="set-range" min="0" max="100" value="81" data-target="oled-val">
                 </div>
               </div>
 
@@ -2178,7 +2162,7 @@
                     <path d="M2 4 H10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
                     <path d="M2 8 H10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
                   </svg>
-                  ЛОКАЛИЗАЦИЯ И ТЕМЫ
+                  ИНТЕРФЕЙС
                 </div>
                 <div class="set-row">
                   <div>
@@ -2194,6 +2178,25 @@
                       <div class="set-dropdown-item selected" data-value="Фиолетовый">Фиолетовый</div>
                       <div class="set-dropdown-item" data-value="Графит">Графит</div>
                       <div class="set-dropdown-item" data-value="Белый">Белый</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="set-row">
+                  <div>
+                    <div class="set-row-label">Размер интерфейса</div>
+                    <div class="set-row-hint">Чёткий масштаб без размытия</div>
+                  </div>
+                  <div class="set-dropdown" data-val="100%" data-ui-scale="true" style="min-width:92px;">
+                    <button class="set-dropdown-btn" type="button" style="min-width:92px;">
+                      <span class="set-dropdown-label">100%</span>
+                      <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1 L5 5 L9 1" stroke="#cdbdff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <div class="set-dropdown-menu">
+                      <div class="set-dropdown-item" data-value="80%">80%</div>
+                      <div class="set-dropdown-item selected" data-value="100%">100%</div>
+                      <div class="set-dropdown-item" data-value="125%">125%</div>
+                      <div class="set-dropdown-item" data-value="150%">150%</div>
+                      <div class="set-dropdown-item" data-value="200%">200%</div>
                     </div>
                   </div>
                 </div>
@@ -2423,6 +2426,7 @@
     const kind = input.dataset.curveRange || '';
     if (kind === 'hyst') return v + '%';
     if (kind === 'delayOn' || kind === 'delayOff') return v + ' сек';
+    if (input.dataset.target === 'led-val' || input.dataset.target === 'oled-val') return Number(v) === 0 ? 'выкл.' : v + '%';
     return v;
   }
 
@@ -2488,6 +2492,14 @@
     function mapX(temp) { return ((clamp(temp, minT, maxT) - minT) / (maxT - minT)) * 1000; }
     function mapY(speed) { return 1000 - clamp(speed, 0, 100) * 10; }
     let curveGeom = null;
+    function curveRuntimeScale() {
+      const style = getComputedStyle(document.documentElement);
+      const read = name => {
+        const value = Number(style.getPropertyValue(name));
+        return Number.isFinite(value) && value > 0 ? value : 1;
+      };
+      return read('--proekt1-ui-scale') * read('--proekt1-dpi-fit');
+    }
     function readCurveGeom() {
       const svg = document.querySelector('.curve-svg');
       const plotEl = byId('curve-plot');
@@ -2495,13 +2507,22 @@
       const svgRect = svg.getBoundingClientRect();
       const plotRect = plotEl.getBoundingClientRect();
       if (!svgRect.width || !svgRect.height) return null;
+      const plotW = plotEl.offsetWidth || plotEl.clientWidth || plotRect.width || 1;
+      const plotH = plotEl.offsetHeight || plotEl.clientHeight || plotRect.height || 1;
+      const measuredScaleX = plotRect.width / plotW || 1;
+      const measuredScaleY = plotRect.height / plotH || 1;
+      const runtimeScale = curveRuntimeScale();
       curveGeom = {
         svgLeft: svgRect.left,
         svgTop: svgRect.top,
         svgWidth: svgRect.width,
         svgHeight: svgRect.height,
         plotLeft: plotRect.left,
-        plotTop: plotRect.top
+        plotTop: plotRect.top,
+        plotWidth: plotW,
+        plotHeight: plotH,
+        plotScaleX: Math.abs(measuredScaleX - 1) > 0.001 ? measuredScaleX : runtimeScale,
+        plotScaleY: Math.abs(measuredScaleY - 1) > 0.001 ? measuredScaleY : runtimeScale
       };
       return curveGeom;
     }
@@ -2527,6 +2548,14 @@
       });
       return best;
     }
+    function curveOverlayPosition(point, geom) {
+      const visualX = geom.svgLeft - geom.plotLeft + mapX(point[0]) / 1000 * geom.svgWidth;
+      const visualY = geom.svgTop - geom.plotTop + mapY(point[1]) / 1000 * geom.svgHeight;
+      return {
+        x: visualX / (geom.plotScaleX || 1),
+        y: visualY / (geom.plotScaleY || 1)
+      };
+    }
     function selectPoint(idx, mode = state.mode) {
       const points = getPoints(mode);
       state.selected[mode] = clamp(Number(idx) || 0, 0, points.length - 1);
@@ -2538,14 +2567,122 @@
     function curveSegmentD(from, to) {
       return 'M ' + mapX(from[0]).toFixed(1) + ' ' + mapY(from[1]).toFixed(1) + ' L ' + mapX(to[0]).toFixed(1) + ' ' + mapY(to[1]).toFixed(1);
     }
+    function clearCurveHoverCanvas() {
+      const canvas = byId('curve-hover-canvas');
+      if (!canvas || canvas.dataset.empty === 'true') return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width || 1, canvas.height || 1);
+      canvas.dataset.previewKey = '';
+      canvas.dataset.empty = 'true';
+    }
+    function prepareCurveHoverCanvas(geom = getCurveGeom()) {
+      const canvas = byId('curve-hover-canvas');
+      const plotEl = byId('curve-plot');
+      if (!canvas || !plotEl || !geom) return null;
+      const cssW = Math.max(1, Math.round(plotEl.offsetWidth || plotEl.clientWidth || geom.plotWidth || 1));
+      const cssH = Math.max(1, Math.round(plotEl.offsetHeight || plotEl.clientHeight || geom.plotHeight || 1));
+      const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+      const targetW = Math.max(1, Math.round(cssW * dpr));
+      const targetH = Math.max(1, Math.round(cssH * dpr));
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+        canvas.dataset.previewKey = '';
+        canvas.dataset.empty = 'true';
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      return { canvas, ctx, cssW, cssH, dpr };
+    }
+    function drawCurveHoverPreview(point, mode = state.mode, geom = getCurveGeom()) {
+      const points = getPoints(mode);
+      const prepared = prepareCurveHoverCanvas(geom);
+      if (!prepared || !point || points.length >= 16) {
+        clearCurveHoverCanvas();
+        return;
+      }
+      let before = null;
+      let after = null;
+      points.forEach(item => {
+        if (item[0] <= point[0]) before = item;
+        else if (!after) after = item;
+      });
+      if (!before && !after) {
+        clearCurveHoverCanvas();
+        return;
+      }
+      const rounded = roundedPoint(point);
+      const previewKey = mode + ':' + points.length + ':' + rounded[0] + ':' + rounded[1] + ':' +
+        (before ? before.join(',') : '-') + ':' + (after ? after.join(',') : '-');
+      const { canvas, ctx, dpr } = prepared;
+      if (canvas.dataset.previewKey === previewKey && canvas.dataset.empty !== 'true') return;
+      canvas.dataset.previewKey = previewKey;
+      canvas.dataset.empty = 'false';
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width || 1, canvas.height || 1);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const color = mode === 'fan' ? 'rgba(255,133,194,0.96)' : 'rgba(139,213,255,0.98)';
+      const glow = mode === 'fan' ? 'rgba(255,133,194,0.34)' : 'rgba(139,213,255,0.38)';
+      const drawSegment = (from, to) => {
+        const a = curveOverlayPosition(from, geom);
+        const b = curveOverlayPosition(to, geom);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      };
+      ctx.save();
+      ctx.lineWidth = 2.2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.setLineDash([10, 8]);
+      ctx.strokeStyle = color;
+      ctx.shadowBlur = 0;
+      if (before) drawSegment(before, point);
+      if (after) drawSegment(point, after);
+      ctx.restore();
+      const pos = curveOverlayPosition(point, geom);
+      ctx.save();
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 9;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = 'rgba(255,255,255,0.88)';
+      ctx.stroke();
+      ctx.restore();
+      ctx.save();
+      ctx.font = '700 11px "JetBrains Mono", Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = mode === 'fan' ? 'rgba(255,133,194,0.86)' : 'rgba(139,213,255,0.86)';
+      ctx.shadowColor = 'rgba(0,0,0,0.82)';
+      ctx.shadowBlur = 6;
+      ctx.fillText(rounded[0] + '\u00b0C / ' + rounded[1] + '%', pos.x, Math.max(16, pos.y - 12));
+      ctx.restore();
+    }
     function hideCurvePreview() {
+      clearCurveHoverCanvas();
       byId('curve-plot')?.classList.remove('is-previewing');
       byId('curve-preview-before')?.setAttribute('d', '');
       byId('curve-preview-after')?.setAttribute('d', '');
     }
     function hideCursorDot() {
-      byId('curve-cursor-dot')?.classList.remove('is-visible');
-      byId('curve-cursor-label')?.classList.remove('is-visible');
+      const dot = byId('curve-cursor-dot');
+      const label = byId('curve-cursor-label');
+      if (dot) {
+        dot.classList.remove('is-visible');
+        dot.dataset.cursorKey = '';
+      }
+      if (label) {
+        label.classList.remove('is-visible');
+        label.dataset.cursorKey = '';
+      }
     }
     let tooltipHideTimer = null;
     function scheduleTooltipHide() {
@@ -2632,50 +2769,40 @@
       const dot = byId('curve-cursor-dot');
       const label = byId('curve-cursor-label');
       if (!dot || !label || !geom || !point) { hideCursorDot(); return; }
-      const x = geom.svgLeft - geom.plotLeft + mapX(point[0]) / 1000 * geom.svgWidth;
-      const y = geom.svgTop  - geom.plotTop  + mapY(point[1]) / 1000 * geom.svgHeight;
-      dot.style.setProperty('--curve-x', x.toFixed(1) + 'px');
-      dot.style.setProperty('--curve-y', y.toFixed(1) + 'px');
+      const pos = curveOverlayPosition(point, geom);
+      const x = Math.round(pos.x);
+      const y = Math.round(pos.y);
+      const rounded = roundedPoint(point);
+      const labelText = rounded[0] + '\u00b0C / ' + rounded[1] + '%';
+      const cursorKey = mode + ':' + x + ':' + y + ':' + labelText;
+      if (dot.dataset.cursorKey !== cursorKey) {
+        dot.style.left = x + 'px';
+        dot.style.top = y + 'px';
+        dot.dataset.cursorKey = cursorKey;
+      }
       dot.classList.toggle('is-pump', mode !== 'fan');
       dot.classList.toggle('is-fan',  mode === 'fan');
       dot.classList.add('is-visible');
-      label.style.setProperty('--curve-x', x.toFixed(1) + 'px');
-      label.style.setProperty('--curve-y', (y - 11).toFixed(1) + 'px');
-      const rounded = roundedPoint(point);
-      const labelText = rounded[0] + '°C / ' + rounded[1] + '%';
+      if (label.dataset.cursorKey !== cursorKey) {
+        label.style.left = x + 'px';
+        label.style.top = (y - 11) + 'px';
+        label.dataset.cursorKey = cursorKey;
+      }
       if (label.textContent !== labelText) label.textContent = labelText;
       label.classList.toggle('is-pump', mode !== 'fan');
       label.classList.toggle('is-fan',  mode === 'fan');
       label.classList.add('is-visible');
     }
-    function previewCurvePoint(point, mode = state.mode) {
-      const plot = byId('curve-plot');
-      const beforePath = byId('curve-preview-before');
-      const afterPath = byId('curve-preview-after');
-      const points = getPoints(mode);
-      if (!plot || !beforePath || !afterPath || !point || points.length >= 16) {
-        hideCurvePreview();
-        return;
-      }
-      let before = null;
-      let after = null;
-      points.forEach(item => {
-        if (item[0] <= point[0]) before = item;
-        else if (!after) after = item;
-      });
-      const previewClass = 'curve-preview-path curve-preview-' + mode;
-      beforePath.setAttribute('class', previewClass);
-      afterPath.setAttribute('class', previewClass);
-      beforePath.setAttribute('d', before ? curveSegmentD(before, point) : '');
-      afterPath.setAttribute('d', after ? curveSegmentD(point, after) : '');
-      plot.classList.toggle('is-previewing', !!(before || after));
+    function previewCurvePoint(point, mode = state.mode, geom = getCurveGeom()) {
+      drawCurveHoverPreview(point, mode, geom);
     }
     function placeTooltip(point, mode = state.mode, geom = getCurveGeom(), pointCount = null) {
       const tooltip = byId('curve-tooltip');
       if (!tooltip || !geom || !point) return;
       tooltip.classList.remove('has-edit');
-      const x = geom.svgLeft - geom.plotLeft + mapX(point[0]) / 1000 * geom.svgWidth;
-      const y = geom.svgTop - geom.plotTop + mapY(point[1]) / 1000 * geom.svgHeight;
+      const pos = curveOverlayPosition(point, geom);
+      const x = pos.x;
+      const y = pos.y;
       const rounded = roundedPoint(point);
       tooltip.classList.toggle('is-fan', mode === 'fan');
       tooltip.classList.toggle('is-pump', mode !== 'fan');
@@ -2819,34 +2946,60 @@
     if (plot) {
       let pendingPointerMove = null;
       let pointerMoveRaf = 0;
+      let lastHoverFrameAt = 0;
+      let lastPreviewKey = '';
+      const hoverPreviewEnabled = true;
       function cancelPointerMoveFrame() {
         pendingPointerMove = null;
         if (pointerMoveRaf) cancelAnimationFrame(pointerMoveRaf);
         pointerMoveRaf = 0;
       }
+      function resetHoverPreviewCache() {
+        lastPreviewKey = '';
+      }
+      function setPlotCursor(value) {
+        if (plot.style.cursor !== value) plot.style.cursor = value;
+      }
       function handlePointerMove(event) {
         const geom = getCurveGeom();
         if (!geom) return;
         if (dragIndex === null) {
+          const now = performance.now();
+          if (now - lastHoverFrameAt < 32) return;
+          lastHoverFrameAt = now;
           if (isNearTooltip(event.clientX, event.clientY)) {
-            plot.style.cursor = 'default';
+            setPlotCursor('default');
+            resetHoverPreviewCache();
             hideCurvePreview();
             hideCursorDot();
             return;
           }
           const points = getPoints();
           if (pickPoint(event, geom, points) !== null) {
-            plot.style.cursor = 'pointer';
+            setPlotCursor('pointer');
+            resetHoverPreviewCache();
             hideCurvePreview();
             hideCursorDot();
             return;
           }
-          plot.style.cursor = '';
+          setPlotCursor('none');
+          if (!hoverPreviewEnabled) {
+            resetHoverPreviewCache();
+            hideCurvePreview();
+            hideCursorDot();
+            return;
+          }
           const hPoint = pointFromEvent(event, geom);
-          previewCurvePoint(hPoint, state.mode);
-          updateCursorDot(hPoint, state.mode, geom);
+          if (!hPoint) return;
+          const previewPoint = [Math.round(hPoint[0]), Math.round(hPoint[1])];
+          const previewKey = state.mode + ':' + points.length + ':' + previewPoint[0] + ':' + previewPoint[1];
+          if (previewKey !== lastPreviewKey) {
+            previewCurvePoint(previewPoint, state.mode, geom);
+            lastPreviewKey = previewKey;
+          }
           return;
         }
+        resetHoverPreviewCache();
         const point = pointFromEvent(event, geom);
         if (!point) return;
         const points = getPoints();
@@ -2863,6 +3016,8 @@
         if (event.button !== undefined && event.button !== 0) return;
         if (event.target.closest('#curve-tooltip')) return;
         readCurveGeom();
+        plot.classList.add('is-hovering');
+        resetHoverPreviewCache();
         hideCursorDot();
         const idx = pickPoint(event);
         hideCurvePreview();
@@ -2914,13 +3069,15 @@
         cancelPointerMoveFrame();
         dragIndex = null;
         plot.classList.remove('is-dragging');
+        resetHoverPreviewCache();
+        try { if (!plot.matches(':hover')) plot.classList.remove('is-hovering'); } catch (e) {}
         try { plot.releasePointerCapture(event.pointerId); } catch (e) {}
         if (byId('curve-tooltip')?.classList.contains('is-visible')) scheduleTooltipHide();
       };
       plot.addEventListener('pointerup', stopDrag);
       plot.addEventListener('pointercancel', stopDrag);
-      plot.addEventListener('pointerenter', readCurveGeom);
-      plot.addEventListener('pointerleave', () => { cancelPointerMoveFrame(); invalidateCurveGeom(); plot.style.cursor = ''; hideCurvePreview(); hideCursorDot(); });
+      plot.addEventListener('pointerenter', () => { plot.classList.add('is-hovering'); resetHoverPreviewCache(); readCurveGeom(); });
+      plot.addEventListener('pointerleave', () => { cancelPointerMoveFrame(); resetHoverPreviewCache(); plot.classList.remove('is-hovering'); invalidateCurveGeom(); setPlotCursor(''); hideCurvePreview(); hideCursorDot(); });
       plot.addEventListener('dblclick', event => {
         if (runtimeActive() || pickPoint(event) !== null) return;
         if (event.target.closest('#curve-tooltip')) return;
@@ -3045,18 +3202,6 @@
     });
     setMode('pump');
   })();
-  // Ховер-эффекты подсветки элемента при клике для справки
-  document.querySelectorAll('[id]').forEach(el => {
-    el.addEventListener('click', function(e) {
-      const id = el.id;
-      if (!id) return;
-      // показать ID в заголовке страницы на секунду
-      const orig = document.title;
-      document.title = '#' + id;
-      setTimeout(() => document.title = orig, 1500);
-    });
-  });
-
   // Custom dropdowns — portal approach (fixed + body) to escape stacking contexts
   function closeAllDropdowns() {
     document.querySelectorAll('.set-dropdown-menu.open').forEach(m => {

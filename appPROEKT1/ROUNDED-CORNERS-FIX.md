@@ -30,9 +30,19 @@ dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, byref(c_int(1
 
 ### 2. Chromium-HWND: hardware-клип через SetWindowRgn ← **это финальный ключ**
 
+> 2026-06-03 update: после проверки live-drag логов HRGN нельзя очищать у видимого normal-mode `QWebEngineView`: прямоугольный Chromium backing сразу проявляется как «уголки» до отпускания ЛКМ. Стабильная реализация держит `SetWindowRgn(CreateRoundRectRgn)` на верхнем WebView HWND и во время native drag/mixed-DPI переноса; внутренние Chromium child-HWND по-прежнему не клипуются.
+
+> 2026-06-03 mixed-DPI update: при переносе DPR=2 → DPR=1 `screenChanged` может прийти раньше, чем Windows обновит native client rect WebView. В логе это выглядело как `logical=1088×752`, `dpi=96`, но `native=2176×1504`; такой stale rect делает HRGN слишком большим и углы видны на первом экране до release. Перед `SetWindowRgn` нужно сверять scale Win32-rect с текущим DPR: если `GetDpiForWindow()` уже доступен, верить ему раньше Qt DPR; при несовпадении брать размер из logical WebView × current DPR.
+
+> 2026-06-03 smooth-drag update: `SetWindowRgn`/HRGN можно и нужно переустанавливать live во время удержания ЛКМ, но Win32 `SetWindowPos` для native-chain WebEngine во время того же drag запрещён. Лог показал, что live pin смешивал физические и логические размеры: WebView мог стать `2200×1520` на DPR=2 или `550×380` внутри окна `1100×760` после возврата на DPR=1. Native-chain pin выполняется после release/verify, а логическая база для расчётов берётся из `centralWidget().rect()`, не из уже дрейфующего `web_view.width()/height()`.
+
+> 2026-06-03 high-DPI live-position update: свежий лог показал, что live resize-pin нельзя возвращать даже guarded: после `screen.changed.live_high_dpi` WebEngine разгонялся `1375×950 → 2750×1900 → 5500×3800`, интерфейс мерцал и уезжал влево. Разрешён только position-only repair (`SWP_NOSIZE`, `x=0,y=0`) для DPR>1, а HRGN во время такого drag берёт фактический текущий `GetClientRect()`, если Chromium ещё не перешёл на physical-size. DPR=1 по-прежнему ждёт release.
+
+> 2026-06-05 compositor-blink update: после долгой проверки редактора кривых подтверждено, что диагональные/ступенчатые/полные блинки интерфейса были не JS-крэшем и не `renderProcessTerminated`, а повреждением аппаратного Chromium compositor-layer внутри прозрачного frameless `QWebEngineView`. Надёжное решение — запускать WebEngine в software compositing: `QTWEBENGINE_CHROMIUM_FLAGS` должен содержать `--disable-gpu --disable-gpu-compositing --disable-gpu-rasterization --disable-zero-copy --disable-accelerated-2d-canvas --disable-webgl`, а `QWebEngineSettings` должен выключать `WebGLEnabled` и `Accelerated2dCanvasEnabled`. После этого пользователь подтвердил: блинки исчезли полностью.
+
 `QWebEngineView` создаёт несколько вложенных нативных HWND (GPU compositor, render widget, input). Chromium рисует в них **opaque-пиксели в прямоугольных границах**. Qt per-pixel alpha их не трогает — они пробиваются сквозь скруглённый силуэт, особенно накапливая GPU-кэш после fullscreen.
 
-Решение — `SetWindowRgn(CreateRoundRectRgn(...))` на web_view HWND и на **все его нативные дети** через `EnumChildWindows`:
+Решение — `SetWindowRgn(CreateRoundRectRgn(...))` на верхний `web_view` HWND. Внутренние Chromium child-HWND не клипуются:
 
 ```python
 def _apply_web_view_native_round_rgn(self):
@@ -50,18 +60,6 @@ def _apply_web_view_native_round_rgn(self):
 
     top_hwnd = int(web_view.winId())
     apply_to(top_hwnd, w, h)
-
-    def enum_cb(child_hwnd, _):
-        r = RECT()
-        if user32.GetClientRect(child_hwnd, byref(r)):
-            cw_w = r.right - r.left
-            cw_h = r.bottom - r.top
-            if cw_w >= w - 4 and cw_h >= h - 4:  # только full-size дети
-                apply_to(int(child_hwnd), cw_w, cw_h)
-        return True
-
-    EnumChildProc = WINFUNCTYPE(BOOL, HWND, LPARAM)
-    user32.EnumChildWindows(HWND(top_hwnd), EnumChildProc(enum_cb), 0)
 ```
 
 Это **hardware-клип** — работает независимо от GPU-состояния, сбрасывает накопленный Chromium-кэш.
@@ -109,6 +107,29 @@ user32.SetWindowPos.restype = BOOL
 
 ---
 
+### 6. WebEngine compositor: software mode обязателен
+
+Для прозрачного frameless `QWebEngineView` аппаратный Chromium compositor может повреждать кадр без крэша процесса: тёмный диагональный слой, серая «лесенка», краткий полный blink или зависший фрагмент до следующего repaint. Это особенно проявляется при быстром hover в редакторе кривых, при reset/max-points и после restore из minimized.
+
+Стабильный режим:
+```python
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join([
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-gpu-rasterization",
+    "--disable-zero-copy",
+    "--disable-accelerated-2d-canvas",
+    "--disable-webgl",
+])
+
+settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, False)
+settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False)
+```
+
+Флаги должны выставляться **до импорта/создания WebEngine**. В `ui-debug.log` при старте должна быть строка `webengine.flags`. Для restore/minimize дополнительно нужен paint-only recovery (`_recover_web_view_after_show()`): stable geometry, HRGN, native redraw, resize event в странице, без reload и без изменения размеров окна.
+
+---
+
 ## Хронология попыток (что не сработало и почему)
 
 | Попытка | Что сделано | Почему не помогло |
@@ -120,16 +141,16 @@ user32.SetWindowPos.restype = BOOL
 | 5 | Geometry-only fullscreen | Сохранило per-pixel alpha, но Chromium GPU-кэш всё равно пробивался |
 | 6 | `SetWindowPos(SWP_FRAMECHANGED)` + `RedrawWindow` | ctypes без argtypes → 64-bit HWND усечён, вызовы уходили в никуда |
 | 7 | Добавлены argtypes + 1px geometry nudge | Помогло при первом выходе, но не стабильно при повторных циклах |
-| **8** | **SetWindowRgn(CreateRoundRectRgn) на web_view HWND + EnumChildWindows** | **✅ Аппаратный клип, независим от GPU-кэша, работает всегда** |
+| **8** | **SetWindowRgn(CreateRoundRectRgn) на верхнем web_view HWND** | **✅ Аппаратный клип, независим от GPU-кэша, работает всегда; HRGN нельзя очищать во время visible drag** |
 
 ---
 
 ## Файлы
 
 - `appPROEKT1/PROEKT1.py` — реализация:
-  - `_apply_web_view_native_round_rgn()` — hardware-клип Chromium HWNDs
+  - `_apply_web_view_native_round_rgn()` — hardware-клип верхнего WebView HWND
   - `_force_native_redraw()` — форс DWM recomposition (SetWindowPos + RedrawWindow, с argtypes)
-  - `_force_geometry_nudge()` — 1px nudge для принудительного resizeEvent
+  - `_force_geometry_nudge()` — legacy 1px nudge helper; после 2026-06-03 не планируется на fullscreen exit, потому что top-level resize виден как скачок frame
   - `_on_web_fullscreen_requested()` — geometry-only fullscreen
   - `_RoundedWindowFrame` — Qt 24px antialiased rounded silhouette
   - `apply_windows_backdrop()` — DWMWCP_DONOTROUND + COLOR_NONE border

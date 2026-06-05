@@ -13,10 +13,35 @@ import math
 import subprocess
 from typing import Optional, Union, Tuple, Any, cast, List
 import asyncio
+
+
+def _install_stable_webengine_env():
+    """Prefer software compositing for QWebEngine on transparent frameless Windows."""
+    try:
+        wanted = [
+            "--disable-gpu",
+            "--disable-gpu-compositing",
+            "--disable-gpu-rasterization",
+            "--disable-zero-copy",
+            "--disable-accelerated-2d-canvas",
+            "--disable-webgl",
+        ]
+        current = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        parts = [part for part in current.split() if part]
+        for flag in wanted:
+            if flag not in parts:
+                parts.append(flag)
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(parts)
+    except Exception:
+        pass
+
+
+_install_stable_webengine_env()
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QMessageBox, QDialog, QSpinBox, QSlider, QTableWidget, QTableWidgetItem, QRadioButton, QButtonGroup, QInputDialog, QLineEdit, QCheckBox, QSystemTrayIcon, QMenu, QGroupBox, QColorDialog, QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy, QPlainTextEdit, QStackedWidget
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF, QRectF, QPoint, QUrl, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF, QRect, QRectF, QPoint, QUrl, Slot
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve, Property, QSize
 from PySide6.QtGui import QIcon
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPixmap, QPainterPath, QImage, QFontMetrics, QRadialGradient, QLinearGradient, QGradient, QTransform, QFontDatabase
@@ -55,6 +80,11 @@ THEMES = {
         'input_bg_alpha': 220,
         'ghost_bg_rgb': '46,46,46',
         'fullscreen_bg': '#08091a',
+        'window_grad0': '#161735',
+        'window_grad1': '#121431',
+        'window_grad2': '#0d0f28',
+        'window_border_rgb': '255,255,255',
+        'window_border_alpha': 31,
     },
     'graphite': {
         'name': 'Графит',
@@ -81,6 +111,11 @@ THEMES = {
         'input_bg_alpha': 220,
         'ghost_bg_rgb': '40,41,46',
         'fullscreen_bg': '#0c0d0f',
+        'window_grad0': '#1d1e22',
+        'window_grad1': '#16171b',
+        'window_grad2': '#101116',
+        'window_border_rgb': '255,255,255',
+        'window_border_alpha': 31,
     },
     'light': {
         'name': 'Белый',
@@ -107,6 +142,11 @@ THEMES = {
         'input_bg_alpha': 235,
         'ghost_bg_rgb': '220,224,235',
         'fullscreen_bg': '#1c1d2e',
+        'window_grad0': '#f5f6fb',
+        'window_grad1': '#eaedf5',
+        'window_grad2': '#dde1ec',
+        'window_border_rgb': '100,80,180',
+        'window_border_alpha': 46,
     },
 }
 
@@ -735,9 +775,6 @@ CONTROL_CHAR_UUID = "0000ffe9-0000-1000-8000-00805f9b34fb"
 LOOP_STAT_CHAR_UUID = "0000ffea-0000-1000-8000-00805f9b34fb"  # петля защиты (статус)
 
 LED_STRIP_LEDS = 20  # должно совпадать с прошивкой (LED_STRIP_LENGTH)
-# Минимальный полезный уровень яркости (5% от 255 =~13). Значение 0 означает «выключить ленту».
-LED_MIN_BRIGHT = 13
-
 def _set_rpm(r1, r2, flags, src=""):
     global _rpm1, _rpm2
     with _rpm_lock:
@@ -836,14 +873,86 @@ class BLETempSender(threading.Thread):
             print(f"BLE: ошибка сканирования: {e}")
             return None
 
+    @staticmethod
+    def _looks_like_ble_disconnect(exc) -> bool:
+        msg = str(exc or "").lower()
+        return any(part in msg for part in (
+            "not connected",
+            "not currently connected",
+            "device is not connected",
+            "disconnected",
+            "connection abort",
+            "connection aborted",
+            "connection reset",
+            "connection is not active",
+            "unreachable",
+            "object has been closed",
+            "operation was canceled",
+            "operation cancelled",
+            "semaphore timeout",
+        ))
+
     async def _connect_and_send(self, address):
         if not BLE_AVAILABLE or BleakClient is None:
             print("BLE: BleakClient не доступен")
             return False
+        disconnect_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _on_client_disconnected(_client):
+            try:
+                loop.call_soon_threadsafe(disconnect_event.set)
+            except Exception:
+                pass
+
         try:
-            async with BleakClient(address, timeout=10.0) as client:
+            try:
+                client_cm = BleakClient(
+                    address,
+                    timeout=10.0,
+                    disconnected_callback=_on_client_disconnected,
+                )
+            except TypeError:
+                client_cm = BleakClient(address, timeout=10.0)
+
+            async with client_cm as client:
                 if not client.is_connected:
+                    self.emitter.signal.emit("BLE: подключение не удалось, повтор")
                     return False
+
+                lost_status_sent = False
+                gatt_failures = 0
+                last_gatt_ok = time.monotonic()
+
+                def _mark_gatt_ok():
+                    nonlocal gatt_failures, last_gatt_ok
+                    gatt_failures = 0
+                    last_gatt_ok = time.monotonic()
+
+                def _mark_link_lost(reason: str = ""):
+                    nonlocal lost_status_sent
+                    if self.stop_flag:
+                        return
+                    if not lost_status_sent:
+                        suffix = f" ({reason})" if reason else ""
+                        print(f"BLE: link lost{suffix}")
+                        self.emitter.signal.emit("BLE: отключено, переподключение")
+                        lost_status_sent = True
+
+                def _should_reconnect_after_error(label: str, exc) -> bool:
+                    nonlocal gatt_failures
+                    gatt_failures += 1
+                    if disconnect_event.is_set() or not client.is_connected:
+                        _mark_link_lost(f"{label}: {exc}")
+                        return True
+                    if self._looks_like_ble_disconnect(exc):
+                        _mark_link_lost(f"{label}: {exc}")
+                        return True
+                    if gatt_failures >= 5 and (time.monotonic() - last_gatt_ok) > 3.0:
+                        _mark_link_lost(f"{label}: repeated GATT failures")
+                        return True
+                    return False
+
                 self.emitter.signal.emit("BLE: Подключено")
                 # Подписка на уведомления статуса петли (мгновенные обновления UI)
                 try:
@@ -859,19 +968,33 @@ class BLETempSender(threading.Thread):
                             # Сообщение в UI-поток, чтобы обновить немедленно
                             self.emitter.signal.emit(f"LOOP:{code}")
                     await client.start_notify(LOOP_STAT_CHAR_UUID, _on_loop_notify)
+                    _mark_gatt_ok()
                 except Exception as e:
+                    if _should_reconnect_after_error("start_notify", e):
+                        return False
                     print(f"BLE: не удалось подписаться на LOOP notify: {e}")
+
                 # Сохраняем текущий локальный статус; устройство синхронизируем отдельной командой LP
                 while not self.stop_flag:
+                    if disconnect_event.is_set() or not client.is_connected:
+                        _mark_link_lost("callback/client state")
+                        return False
+
                     # Urgent purge — немедленная отправка PG в обход очереди
                     if self.urgent_purge:
                         try:
                             await client.write_gatt_char(CONTROL_CHAR_UUID, b'PG', response=False)
+                            _mark_gatt_ok()
                             print("BLE: urgent purge PG sent")
                         except Exception as e:
                             print(f"BLE: urgent purge error: {e}")
+                            self.urgent_purge = False
+                            self._purge_done.set()
+                            if _should_reconnect_after_error("urgent purge", e):
+                                return False
                         self.urgent_purge = False
                         self._purge_done.set()
+
                     # Очередь команд
                     try:
                         while not tx_cmd_queue.empty():
@@ -880,77 +1003,113 @@ class BLETempSender(threading.Thread):
                                 if kind == "fan_curve":
                                     print(f"Sending fan curve, len={len(payload)}")
                                     await client.write_gatt_char(CFG_CHAR_UUID, payload, response=False)
+                                    _mark_gatt_ok()
                                 elif kind == "pump_curve":
                                     print(f"Sending pump curve, len={len(payload)}")
                                     await client.write_gatt_char(PUMP_CFG_CHAR_UUID, payload, response=False)
+                                    _mark_gatt_ok()
                                 elif kind == "hours_write":
                                     # payload may be (blob, force); BLE ignores force
                                     blob = payload[0] if isinstance(payload, tuple) else payload
                                     print(f"Sending pump hours, len={len(blob)}")
                                     await client.write_gatt_char(HOURS_CHAR_UUID, blob, response=False)
+                                    _mark_gatt_ok()
                                 elif kind == "led":
                                     print(f"Sending LED command, len={len(payload)}")
                                     # Use write-with-response to allow long writes (custom colors > 20 bytes)
                                     await client.write_gatt_char(LED_CHAR_UUID, payload, response=True)
+                                    _mark_gatt_ok()
                                 elif kind == "ctrl":
                                     print(f"Sending control cmd, len={len(payload)}")
                                     await client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False)
+                                    _mark_gatt_ok()
                                 elif kind == "read_loop_status_once":
                                     try:
                                         data = await client.read_gatt_char(LOOP_STAT_CHAR_UUID)
+                                        _mark_gatt_ok()
                                         if data and len(data) >= 1:
                                             code = int(data[0])
                                             with _loop_status_lock:
                                                 global _loop_status_code
                                                 _loop_status_code = code
                                             self.emitter.signal.emit(f"LOOP:{code}")
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        if _should_reconnect_after_error("read_loop_status_once", e):
+                                            return False
                             except Exception as e:
                                 print(f"BLE cmd error: {e}")
+                                if _should_reconnect_after_error(f"cmd {kind}", e):
+                                    return False
                     except queue.Empty:
                         pass
+
                     # Отправка температур
                     cpu, gpu = self.get_temps()
                     if cpu != "--" and gpu != "--":
                         data = struct.pack('<ii', int(cpu), int(gpu))
                         try:
                             await client.write_gatt_char(CHAR_UUID, data, response=False)
+                            _mark_gatt_ok()
                         except Exception as e:
+                            if _should_reconnect_after_error("temperature write", e):
+                                return False
                             self.emitter.signal.emit(f"BLE: ошибка отправки {e}")
                             return False
+
                     # Чтение RPM
                     try:
                         data = await client.read_gatt_char(RPM_CHAR_UUID)
-                        rpm1, rpm2, flags = struct.unpack('<iiI', data)
-                        _set_rpm(rpm1, rpm2, flags, "BLE")
-                    except Exception:
-                        pass
+                        _mark_gatt_ok()
+                        try:
+                            rpm1, rpm2, flags = struct.unpack('<iiI', data)
+                            _set_rpm(rpm1, rpm2, flags, "BLE")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        if _should_reconnect_after_error("rpm read", e):
+                            return False
+
                     # Чтение температуры воды
                     try:
                         data = await client.read_gatt_char(WATER_CHAR_UUID)
-                        (water_c,) = struct.unpack('<i', data)
-                        with _water_lock:
-                            global _water_temp
-                            _water_temp = str(int(water_c))
-                            global _water_last_ts
-                            _water_last_ts = time.time()
-                    except Exception:
-                        pass
+                        _mark_gatt_ok()
+                        try:
+                            (water_c,) = struct.unpack('<i', data)
+                            with _water_lock:
+                                global _water_temp
+                                _water_temp = str(int(water_c))
+                                global _water_last_ts
+                                _water_last_ts = time.time()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        if _should_reconnect_after_error("water read", e):
+                            return False
+
                     # Чтение моточасов
                     try:
                         data = await client.read_gatt_char(HOURS_CHAR_UUID)
+                        _mark_gatt_ok()
                         global global_pump_hours
                         global_pump_hours = data
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if _should_reconnect_after_error("hours read", e):
+                            return False
+
                     # Статус петли теперь приходит по notify; периодическое чтение необязательно
                     for _ in range(10):
                         if self.stop_flag or self.urgent_purge:
                             break
+                        if disconnect_event.is_set() or not client.is_connected:
+                            _mark_link_lost("callback/client state")
+                            return False
                         await asyncio.sleep(0.1)
         except Exception as e:
-            self.emitter.signal.emit(f"BLE: ошибка {e}")
+            if not self.stop_flag:
+                if self._looks_like_ble_disconnect(e):
+                    self.emitter.signal.emit("BLE: отключено, переподключение")
+                else:
+                    self.emitter.signal.emit(f"BLE: ошибка {e}")
             return False
         return True
 
@@ -2952,16 +3111,12 @@ class SettingsDialog(QDialog, FramelessWindowMixin):
         brightness_label.setStyleSheet("color: #FFFFFF; font-size: 12pt;")
         brightness_layout.addWidget(brightness_label)
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        # Разрешаем 0 для полного выключения, а минимальный полезный уровень — LED_MIN_BRIGHT
         self.brightness_slider.setRange(0, 255)
         try:
             init_b = int(self.brightness)
         except Exception:
             init_b = 255
-        if init_b == 0:
-            self.brightness_slider.setValue(0)
-        else:
-            self.brightness_slider.setValue(max(init_b, LED_MIN_BRIGHT))
+        self.brightness_slider.setValue(max(0, min(255, init_b)))
         self.brightness_slider.setStyleSheet("QSlider::groove:horizontal { background: #555555; height: 4px; } QSlider::handle:horizontal { background: #FFFFFF; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }")
         self.brightness_slider.valueChanged.connect(self.update_brightness_value)
         # Вариант А: отправлять только при отпускании ползунка (без промежуточных отправок)
@@ -3128,17 +3283,11 @@ class SettingsDialog(QDialog, FramelessWindowMixin):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def update_brightness_value(self, value):
-        # 0 = выключить ленту; иначе минимальный полезный уровень = LED_MIN_BRIGHT (≈5%)
         try:
             v = int(value)
         except Exception:
-            v = LED_MIN_BRIGHT
-        if v == 0:
-            self.brightness = 0
-        else:
-            if v < LED_MIN_BRIGHT:
-                v = LED_MIN_BRIGHT
-            self.brightness = v
+            v = 255
+        self.brightness = max(0, min(255, v))
 
     def update_oled_brightness_value(self, value):
         self.oled_brightness = value
@@ -4511,11 +4660,24 @@ class _RoundedWindowFrame(QWidget):
     def __init__(self, parent: Optional[QWidget] = None, radius: int = 24):
         super().__init__(parent)
         self._radius = int(radius)
+        self._scale_factor = 1.0
+        self._theme_name = current_theme_name()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
         self.setStyleSheet("")
+
+    def setTheme(self, theme_name: Optional[str] = None):
+        self._theme_name = theme_name if theme_name in THEMES else current_theme_name()
+        self.update()
+
+    def setScaleFactor(self, scale_factor: float):
+        try:
+            self._scale_factor = max(0.25, min(2.0, float(scale_factor)))
+        except Exception:
+            self._scale_factor = 1.0
+        self.update()
 
     def paintEvent(self, event):  # type: ignore[override]
         p = QPainter(self)
@@ -4524,16 +4686,35 @@ class _RoundedWindowFrame(QWidget):
         p.fillRect(self.rect(), Qt.GlobalColor.transparent)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = max(1.0, float(self._radius) * float(getattr(self, '_scale_factor', 1.0)))
         path = QPainterPath()
-        path.addRoundedRect(r, self._radius, self._radius)
+        path.addRoundedRect(r, radius, radius)
+        theme = THEMES.get(self._theme_name, THEMES['violet'])
         grad = QLinearGradient(QPointF(0, 0), QPointF(max(1, self.width()), max(1, self.height())))
-        grad.setColorAt(0.0, QColor("#161735"))
-        grad.setColorAt(0.55, QColor("#121431"))
-        grad.setColorAt(1.0, QColor("#0d0f28"))
+        grad.setColorAt(0.0, QColor(theme.get('window_grad0', '#161735')))
+        grad.setColorAt(0.55, QColor(theme.get('window_grad1', '#121431')))
+        grad.setColorAt(1.0, QColor(theme.get('window_grad2', '#0d0f28')))
         p.fillPath(path, QBrush(grad))
-        p.setPen(QPen(QColor(255, 255, 255, 31), 1))
+        try:
+            br, bg, bb = [int(x.strip()) for x in str(theme.get('window_border_rgb', '255,255,255')).split(',')[:3]]
+            border = QColor(br, bg, bb, int(theme.get('window_border_alpha', 31)))
+        except Exception:
+            border = QColor(255, 255, 255, 31)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        # Keep the bright line away from the antialiased outer pixels. A subtle
+        # dark inner rim hides HRGN stair-steps on vivid wallpapers.
+        rim_rect = QRectF(self.rect()).adjusted(0.95, 0.95, -0.95, -0.95)
+        rim_path = QPainterPath()
+        rim_path.addRoundedRect(rim_rect, max(1.0, radius - 0.95), max(1.0, radius - 0.95))
+        p.setPen(QPen(QColor(0, 0, 0, 72), 1))
+        p.drawPath(rim_path)
+        if self._theme_name != 'light':
+            border.setAlpha(min(border.alpha(), 18))
+        border_rect = QRectF(self.rect()).adjusted(1.75, 1.75, -1.75, -1.75)
+        border_path = QPainterPath()
+        border_path.addRoundedRect(border_rect, max(1.0, radius - 1.75), max(1.0, radius - 1.75))
+        p.setPen(QPen(border, 1))
+        p.drawPath(border_path)
         p.end()
 
 
@@ -5142,6 +5323,13 @@ class _WebUiBridge(QObject):
         except Exception:
             pass
 
+    @Slot(str, str)
+    def debugLog(self, tag: str, payload: str):
+        try:
+            self._owner._ui_debug_log("JS." + str(tag or "event"), payload=str(payload or ""))
+        except Exception:
+            pass
+
 
 class _WebEngineChromeView(QWebEngineView):
     """QWebEngineView с drag-зонами для frameless-окна."""
@@ -5151,6 +5339,7 @@ class _WebEngineChromeView(QWebEngineView):
         self._drag_active = False
         self._drag_origin_global = QPoint()
         self._drag_window_origin = QPoint()
+        self._last_debug_move_ts = 0.0
 
     def _is_drag_zone(self, pos) -> bool:
         x = float(pos.x())
@@ -5172,6 +5361,15 @@ class _WebEngineChromeView(QWebEngineView):
                 self._drag_window_origin = self._owner.frameGeometry().topLeft()
             except Exception:
                 self._drag_window_origin = self._owner.pos()
+            try:
+                self._owner._ui_debug_log(
+                    "webview.mousePress.legacyDrag.start",
+                    pos={"x": float(event.position().x()), "y": float(event.position().y())},
+                    globalPos={"x": self._drag_origin_global.x(), "y": self._drag_origin_global.y()},
+                    winOrigin={"x": self._drag_window_origin.x(), "y": self._drag_window_origin.y()},
+                )
+            except Exception:
+                pass
             event.accept()
             return
         self._drag_active = False
@@ -5181,6 +5379,17 @@ class _WebEngineChromeView(QWebEngineView):
         if self._drag_active and event.buttons() & Qt.MouseButton.LeftButton:
             delta = event.globalPosition().toPoint() - self._drag_origin_global
             self._owner.move(self._drag_window_origin + delta)
+            try:
+                now = time.monotonic()
+                if now - float(getattr(self, '_last_debug_move_ts', 0.0)) >= 0.12:
+                    self._last_debug_move_ts = now
+                    self._owner._ui_debug_log(
+                        "webview.mouseMove.legacyDrag.move",
+                        delta={"x": delta.x(), "y": delta.y()},
+                        targetPos={"x": (self._drag_window_origin + delta).x(), "y": (self._drag_window_origin + delta).y()},
+                    )
+            except Exception:
+                pass
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -5188,6 +5397,15 @@ class _WebEngineChromeView(QWebEngineView):
     def mouseReleaseEvent(self, event):  # type: ignore[override]
         if self._drag_active:
             self._drag_active = False
+            try:
+                self._owner._ui_debug_log(
+                    "webview.mouseRelease.legacyDrag.end",
+                    pos={"x": float(event.position().x()), "y": float(event.position().y())},
+                    globalPos={"x": event.globalPosition().toPoint().x(), "y": event.globalPosition().toPoint().y()},
+                )
+                self._owner._ui_debug_state("legacyDrag.release", include_dom=True)
+            except Exception:
+                pass
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -5218,13 +5436,16 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         except Exception:
             pass
-        if ENABLE_GLASS_BACKDROP:
-            try:
-                self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-                self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-                self.setAutoFillBackground(False)
-            except Exception:
-                pass
+        # QWebEngineView paints through a native child HWND. If the top-level
+        # MainWindow stays WS_EX_LAYERED/per-pixel-transparent, Windows can
+        # hit-test the web-only center as transparent after DPI/scale changes.
+        # The actual rounded silhouette is now handled by SetWindowRgn.
+        try:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+            self.setAutoFillBackground(True)
+        except Exception:
+            pass
         try:
             self.enable_frameless_drag()
         except Exception:
@@ -5233,7 +5454,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             apply_app_theme(QApplication.instance())
         except Exception:
             pass
-        self.setStyleSheet("QMainWindow#mainWindow { background: transparent; border: none; }")
+        self.setStyleSheet("QMainWindow#mainWindow { background: #121431; border: none; }")
         self.purge_active = False
         self._prev_loop_status_code = None  # track LOOP: status code (legacy, kept for reconnect reset)
         self.current_mode = 0
@@ -5254,11 +5475,37 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self._last_valid_temp_ts: float = 0.0
         self._temp_hold_seconds: float = 10.0
         self.setWindowTitle("PROEKT1 — Мониторинг температур")
-        self.setWindowIcon(QIcon())
-        self.setMinimumSize(960, 660)
-        self.resize(1100, 760)
+        self.setWindowIcon(QIcon(_icon_pixmap("sparkle", size=32, color="#cdbdff")))
+        self.config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self._design_window_w = 1100
+        self._design_window_h = 760
+        self._design_min_w = 960
+        self._design_min_h = 660
+        self.interface_scale_percent = self._read_initial_interface_scale_percent()
+        ui_debug_env = str(os.environ.get("PROEKT1_UI_DEBUG", "1")).strip().lower()
+        ui_debug_deep_env = str(os.environ.get("PROEKT1_UI_DEBUG_DEEP", "0")).strip().lower()
+        self._ui_debug_enabled = ui_debug_env not in ("0", "false", "no", "off")
+        self._ui_debug_deep = self._ui_debug_enabled and (ui_debug_env in ("2", "deep", "verbose", "full") or ui_debug_deep_env in ("1", "true", "yes", "on", "deep", "verbose", "full"))
+        self._ui_debug_t0 = time.monotonic()
+        self._ui_debug_seq = 0
+        self._dpi_fit_factor = 1.0
+        self._dpi_target_fit_factor = 1.0
+        self._screen_surface_rebuild_pending = False
+        self._native_drag_active = False
+        self._web_native_round_rgn_block_until = 0.0
+        self._web_engine_zoom_factor = 1.0
+        self._web_active_view = "dashboard"
+        self._ui_debug_log("debug.enabled", env=os.environ.get("PROEKT1_UI_DEBUG", "1"), deep=bool(getattr(self, '_ui_debug_deep', False)), deepEnv=os.environ.get("PROEKT1_UI_DEBUG_DEEP", "0"))
+        self._set_main_window_opaque_hit_surface("init")
+        _initial_fit = self._dpi_fit_factor_for_screen(QApplication.primaryScreen())
+        _initial_min_w, _initial_min_h = self._scaled_minimum_size(_initial_fit)
+        _initial_w, _initial_h = self._scaled_window_size(_initial_fit)
+        self.setMinimumSize(_initial_min_w, _initial_min_h)
+        self.resize(_initial_w, _initial_h)
+        self._apply_dpi_window_metrics(QApplication.primaryScreen(), resize_window=True)
+        self._ui_debug_state("after.initial_dpi_metrics", include_dom=False)
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon())
+        self.tray_icon.setIcon(self.windowIcon())
         self.tray_icon.setToolTip("PROEKT1")
         # Tray menu with Show and Exit
         tray_menu = QMenu()
@@ -5289,6 +5536,8 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self._autostart_timer.timeout.connect(self._on_autostart_tick)
         central = _RoundedWindowFrame()
         central.setObjectName("glassRoot")
+        self._rounded_frame = central
+        self._rounded_frame.setTheme(current_theme_name())
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
@@ -5631,7 +5880,9 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self.led_config_loaded = False
         self.transport = "BLE"
         self.load_app_config()
+        self._apply_interface_scale(resize_window=True)
         try:
+            self._rounded_frame.setTheme(getattr(self, 'theme', current_theme_name()))
             self._lifecycle_overlay.setTheme(getattr(self, 'theme', current_theme_name()))
         except Exception:
             pass
@@ -5782,13 +6033,12 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
         try:
+            self._ui_debug_state("resizeEvent.start", include_dom=False)
             web_view = getattr(self, 'web_view', None)
             cw = self.centralWidget()
             if web_view is not None and cw is not None:
-                web_view.setGeometry(cw.rect())
-                self._reset_web_view_clip()
-                self._apply_web_view_native_round_rgn()
-                web_view.raise_()
+                self._set_web_view_geometry_stable(cw.rect(), "resizeEvent")
+                QTimer.singleShot(0, lambda: self._ui_debug_state("resizeEvent.after_web_geometry", include_dom=True))
             overlay = getattr(self, '_lifecycle_overlay', None)
             if overlay is not None and cw is not None:
                 overlay.setGeometry(cw.rect())
@@ -5797,6 +6047,13 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
         self._apply_rounded_mask()
+
+    def moveEvent(self, event):  # type: ignore[override]
+        super().moveEvent(event)
+        try:
+            self._ui_debug_state("moveEvent", include_dom=False)
+        except Exception:
+            pass
 
     def _raise_overlay_hwnd_above_webview(self):
         """Win32-level Z-order fix: place the lifecycle overlay's HWND above the
@@ -5826,6 +6083,175 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
+    def _clear_web_view_native_round_rgn(self):
+        if os.name != 'nt':
+            return
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None:
+            return
+        try:
+            self._ui_debug_log("web.rgn.clear.start", webHwnd=hex(int(web_view.winId())))
+            user32 = ctypes.windll.user32
+            user32.SetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+            user32.SetWindowRgn.restype = ctypes.c_int
+            result = user32.SetWindowRgn(wintypes.HWND(int(web_view.winId())), 0, True)
+            self._ui_debug_log("web.rgn.clear.done", result=int(result), webHwnd=self._ui_debug_hwnd(int(web_view.winId())))
+        except Exception:
+            pass
+
+    def _suppress_web_view_native_round_rgn(self, reason: str = "", ms: int = 650):
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is not None and web_view.isVisible() and not getattr(self, '_web_fs_active', False):
+                self._ui_debug_log(
+                    "web.rgn.suppress.ignored",
+                    reason=str(reason or ""),
+                    keep="visible_normal_surface_must_stay_clipped",
+                )
+                self._apply_web_view_native_round_rgn()
+                return
+            self._web_native_round_rgn_block_until = max(
+                float(getattr(self, '_web_native_round_rgn_block_until', 0.0) or 0.0),
+                time.monotonic() + max(0.05, min(3.0, float(ms) / 1000.0)),
+            )
+            self._ui_debug_log(
+                "web.rgn.suppress",
+                reason=str(reason or ""),
+                ms=int(ms),
+                until=float(getattr(self, '_web_native_round_rgn_block_until', 0.0) or 0.0),
+            )
+            self._clear_web_view_native_round_rgn()
+        except Exception:
+            pass
+
+    def _schedule_web_view_native_round_rgn_reapply(self, reason: str = ""):
+        try:
+            if os.name != 'nt':
+                return
+            base = str(reason or "web.rgn.reapply")
+
+            def _try_apply(label: str):
+                try:
+                    if getattr(self, '_native_drag_active', False) or self._is_left_mouse_button_down():
+                        self._ui_debug_log("web.rgn.reapply.live", reason=base, label=label)
+                    self._apply_web_view_native_round_rgn()
+                except Exception:
+                    pass
+
+            QTimer.singleShot(140, lambda: _try_apply("140ms"))
+            QTimer.singleShot(420, lambda: _try_apply("420ms"))
+            QTimer.singleShot(950, lambda: _try_apply("950ms"))
+        except Exception:
+            pass
+
+    def _web_view_expected_native_metrics(self, web_view=None, hwnd_int: int = 0, client_hwnd: int = 0) -> dict:
+        if web_view is None:
+            web_view = getattr(self, 'web_view', None)
+        logical_source = "web_view"
+        logical_w = max(int(web_view.width()) if web_view is not None else 1, 1)
+        logical_h = max(int(web_view.height()) if web_view is not None else 1, 1)
+        try:
+            cw = self.centralWidget()
+            if cw is not None and int(cw.width()) > 1 and int(cw.height()) > 1:
+                # QWidget geometry is logical. The native WebEngine HWND may be
+                # temporarily resized in physical pixels by Win32 repair code;
+                # never feed that drift back into DPR/fit calculations.
+                logical_w = max(1, int(cw.width()))
+                logical_h = max(1, int(cw.height()))
+                logical_source = "central"
+        except Exception:
+            pass
+        qt_scale = 1.0
+        hwnd_scale = 0.0
+        if web_view is not None:
+            try:
+                qt_scale = max(qt_scale, float(web_view.devicePixelRatioF()))
+            except Exception:
+                pass
+            try:
+                handle = web_view.windowHandle()
+                if handle is not None:
+                    qt_scale = max(qt_scale, float(handle.devicePixelRatio()))
+            except Exception:
+                pass
+        try:
+            if os.name == 'nt' and hwnd_int:
+                user32 = ctypes.windll.user32
+                user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+                user32.GetDpiForWindow.restype = wintypes.UINT
+                dpi = int(user32.GetDpiForWindow(wintypes.HWND(int(hwnd_int))))
+                if dpi > 0:
+                    hwnd_scale = dpi / 96.0
+        except Exception:
+            pass
+        # For native Win32 sizing, GetDpiForWindow is the authority when it is
+        # available. Qt's devicePixelRatioF can lag for a few frames during
+        # mixed-DPI drag, especially when returning from DPR=2 to DPR=1.
+        expected_scale = hwnd_scale if hwnd_scale > 0 else qt_scale
+        expected_scale = max(0.5, min(4.0, float(expected_scale or 1.0)))
+        native_w = max(logical_w, int(round(logical_w * expected_scale)))
+        native_h = max(logical_h, int(round(logical_h * expected_scale)))
+        client = {"accepted": False}
+        try:
+            if os.name == 'nt' and client_hwnd:
+                user32 = ctypes.windll.user32
+                rect = wintypes.RECT()
+                user32.GetClientRect.argtypes = [
+                    wintypes.HWND, ctypes.POINTER(wintypes.RECT),
+                ]
+                user32.GetClientRect.restype = wintypes.BOOL
+                if user32.GetClientRect(wintypes.HWND(int(client_hwnd)), ctypes.byref(rect)):
+                    client_w = int(rect.right - rect.left)
+                    client_h = int(rect.bottom - rect.top)
+                    client.update({"w": client_w, "h": client_h})
+                    if client_w > 0 and client_h > 0:
+                        scale_x = client_w / float(logical_w)
+                        scale_y = client_h / float(logical_h)
+                        client.update({"scaleX": scale_x, "scaleY": scale_y})
+                        # During mixed-DPI drag Qt may emit screenChanged before
+                        # Windows has resized the existing HWND client rect. If we
+                        # accept that stale DPR=2 rect on a DPR=1 screen, HRGN
+                        # rounds corners outside the visible window and square
+                        # corners leak until mouse release.
+                        live_drag = False
+                        try:
+                            live_drag = (
+                                bool(getattr(self, '_native_drag_active', False))
+                                or self._is_left_mouse_button_down()
+                            )
+                        except Exception:
+                            live_drag = False
+                        if (
+                            live_drag
+                            and expected_scale > 1.01
+                            and scale_x < expected_scale - 0.25
+                            and scale_y < expected_scale - 0.25
+                        ):
+                            native_w = max(logical_w, client_w)
+                            native_h = max(logical_h, client_h)
+                            client["accepted"] = True
+                            client["acceptedLiveDragCurrentRect"] = True
+                            client["expectedScale"] = expected_scale
+                        elif abs(scale_x - expected_scale) <= 0.25 and abs(scale_y - expected_scale) <= 0.25:
+                            native_w = max(native_w, client_w)
+                            native_h = max(native_h, client_h)
+                            client["accepted"] = True
+                        else:
+                            client["stale"] = True
+                            client["expectedScale"] = expected_scale
+        except Exception as exc:
+            client["error"] = str(exc)
+        return {
+            "logicalW": logical_w,
+            "logicalH": logical_h,
+            "logicalSource": logical_source,
+            "nativeW": native_w,
+            "nativeH": native_h,
+            "expectedScale": expected_scale,
+            "scaleSources": {"qt": qt_scale, "hwnd": hwnd_scale if hwnd_scale > 0 else None},
+            "client": client,
+        }
+
     def _apply_web_view_native_round_rgn(self):
         """Hard-clip the QWebEngineView native HWND to the rounded app frame.
 
@@ -5842,44 +6268,44 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         web_view = getattr(self, 'web_view', None)
         if web_view is None:
             return
+        # Do not install a native region while the WebEngine view is hidden
+        # behind the startup overlay. On mixed-DPI Windows this can make the
+        # Chromium surface start in an occluded/blank state before its first
+        # visible frame. Apply/clear the region only after web_view.show().
+        if not web_view.isVisible():
+            self._ui_debug_log("web.rgn.apply.skip", reason="web_view_not_visible")
+            self._clear_web_view_native_round_rgn()
+            return
+        # The WebEngine native HWND is rectangular. If we clear HRGN during drag,
+        # the user immediately sees square "ears" outside the Qt rounded frame.
+        # Keep/reapply the top-level region while visible; only fullscreen and
+        # hidden startup/shutdown surfaces are allowed to be unclipped.
         # In fullscreen mode the dark backdrop is painted by Chromium across the
         # whole screen rect — applying a rounded HRGN here would round its corners
         # too (the user sees that as "the fullscreen fill has rounded corners").
         # Strip the region so the backdrop fills the entire screen rectangle.
         # The inner 1100x760 .app-window keeps its own 24px rounding via CSS clip-path.
         if getattr(self, '_web_fs_active', False):
-            try:
-                user32 = ctypes.windll.user32
-                user32.SetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
-                user32.SetWindowRgn.restype = ctypes.c_int
-                top_hwnd = int(web_view.winId())
-                user32.SetWindowRgn(wintypes.HWND(top_hwnd), 0, True)
-            except Exception:
-                pass
+            self._ui_debug_log("web.rgn.apply.skip", reason="fullscreen")
+            self._clear_web_view_native_round_rgn()
             return
         try:
             gdi32 = ctypes.windll.gdi32
             user32 = ctypes.windll.user32
             top_hwnd = int(web_view.winId())
-            logical_w = max(int(web_view.width()), 1)
-            logical_h = max(int(web_view.height()), 1)
-            native_w = logical_w
-            native_h = logical_h
-            user32.GetClientRect.argtypes = [
-                wintypes.HWND, ctypes.POINTER(wintypes.RECT),
-            ]
-            user32.GetClientRect.restype = wintypes.BOOL
-            rect = wintypes.RECT()
-            if user32.GetClientRect(wintypes.HWND(top_hwnd), ctypes.byref(rect)):
-                client_w = int(rect.right - rect.left)
-                client_h = int(rect.bottom - rect.top)
-                if client_w > 0 and client_h > 0:
-                    native_w = client_w
-                    native_h = client_h
+            self._clear_native_click_through_style(top_hwnd, "web_view")
+            metrics = self._web_view_expected_native_metrics(web_view, top_hwnd, top_hwnd)
+            logical_w = int(metrics.get("logicalW", 1) or 1)
+            logical_h = int(metrics.get("logicalH", 1) or 1)
+            native_w = int(metrics.get("nativeW", logical_w) or logical_w)
+            native_h = int(metrics.get("nativeH", logical_h) or logical_h)
             scale_x = native_w / float(logical_w)
             scale_y = native_h / float(logical_h)
             dpi_scale = max(0.5, min(4.0, (scale_x + scale_y) / 2.0))
-            radius_diam = max(1, int(round(48 * dpi_scale)))  # 2 * 24px in native HWND pixels
+            design_w = max(1, int(getattr(self, '_design_window_w', logical_w)))
+            design_h = max(1, int(getattr(self, '_design_window_h', logical_h)))
+            visual_scale = max(0.25, min(4.0, min(native_w / float(design_w), native_h / float(design_h))))
+            radius_diam = max(1, int(round(48 * visual_scale)))  # 2 * 24px in final physical pixels
             gdi32.CreateRoundRectRgn.argtypes = [
                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.c_int, ctypes.c_int,
@@ -5900,6 +6326,15 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                     pass
 
             _apply_to(top_hwnd, native_w, native_h)
+            self._ui_debug_log(
+                "web.rgn.apply.done",
+                topHwnd=hex(top_hwnd), logical={"w": logical_w, "h": logical_h},
+                native={"w": native_w, "h": native_h}, dpiScale=dpi_scale,
+                visualScale=visual_scale, radiusDiam=radius_diam,
+                scaleSources=metrics.get("scaleSources"),
+                client=metrics.get("client"),
+                hwnd=self._ui_debug_hwnd(top_hwnd),
+            )
 
             # NOTE: we deliberately do NOT clip Chromium child HWNDs.
             # Applying SetWindowRgn to the internal D3D / RenderWidgetHost
@@ -5923,36 +6358,154 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         # SetWindowRgn we installed on the QWebEngineView's HWND.
         self._apply_web_view_native_round_rgn()
 
-    def _refresh_web_view_surface(self):
+    def _set_web_view_geometry_stable(self, rect, reason: str = "", sync_fit: bool = True, reset_clip: bool = True, raise_view: bool = True):
+        """Apply QWebEngineView geometry and immediately pin its native HWND chain.
+
+        On mixed-DPI Windows, Qt can briefly move Chromium child HWNDs in
+        monitor-local coordinates after a QWidget geometry change. If that frame
+        reaches DWM, the UI appears to jump to (0,0) or flicker. Pinning in the
+        same event handler closes that visible gap.
+        """
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None or rect is None:
+            return False
+        try:
+            if int(rect.width()) <= 0 or int(rect.height()) <= 0:
+                return False
+        except Exception:
+            return False
+        try:
+            had_logical_drift = web_view.geometry() != rect
+            if had_logical_drift:
+                web_view.setGeometry(rect)
+            if sync_fit:
+                self._sync_actual_web_fit_factor()
+            needs_pin = (
+                had_logical_drift
+                or bool(getattr(self, '_web_fs_active', False))
+                or self._web_surface_needs_native_pin()
+            )
+            if needs_pin:
+                self._pin_web_view_native_chain(str(reason or "web.geometry") + ".pin_after_set_geometry")
+            if reset_clip:
+                self._reset_web_view_clip()
+            if needs_pin:
+                self._pin_web_view_native_chain(str(reason or "web.geometry") + ".pin_after_clip")
+            if raise_view:
+                web_view.raise_()
+            if not bool(getattr(self, '_web_fs_active', False)) and web_view.geometry() != rect:
+                self._ui_debug_log(
+                    "web.geometry.restore_logical",
+                    reason=str(reason or ""),
+                    fromRect=self._ui_debug_rect(web_view.geometry()),
+                    toRect=self._ui_debug_rect(rect),
+                )
+                web_view.setGeometry(rect)
+                if sync_fit:
+                    self._sync_actual_web_fit_factor()
+            return True
+        except Exception as exc:
+            try:
+                self._ui_debug_log("web.geometry.stable.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+            return False
+
+    def _web_surface_backing_color(self) -> str:
+        try:
+            theme_name = getattr(self, 'theme', current_theme_name())
+            palette = THEMES.get(theme_name, THEMES['violet'])
+            return str(palette.get('window_grad1', '#121431') or '#121431')
+        except Exception:
+            return '#121431'
+
+    def _apply_web_view_backing(self):
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return
+            color = self._web_surface_backing_color()
+            web_view.setStyleSheet(f"background: {color}; border: none;")
+            web_view.page().setBackgroundColor(QColor(color))
+            try:
+                web_view.page().runJavaScript(
+                    "document.documentElement.style.setProperty('--proekt1-window-bg', "
+                    f"{json.dumps(color)});"
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _set_web_view_opaque_input_surface(self, reason: str = ""):
+        """Keep Chromium visually rounded by HRGN, but non-transparent for mouse input."""
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return
+            web_view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            web_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+            web_view.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+            web_view.setAutoFillBackground(True)
+            try:
+                if os.name == 'nt':
+                    self._clear_native_click_through_tree(int(web_view.winId()), "web_input_surface:" + str(reason or ""))
+            except Exception:
+                pass
+            self._ui_debug_log(
+                "web.input_surface.opaque",
+                reason=str(reason or ""),
+                translucent=bool(web_view.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)),
+                transparentForMouse=bool(web_view.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)),
+            )
+        except Exception:
+            pass
+
+    def _refresh_web_view_surface(self, opacity_nudge: bool = True):
         web_view = getattr(self, 'web_view', None)
         if web_view is None:
             return
         try:
-            web_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            web_view.setStyleSheet("background: transparent; border: none;")
-            # Page background must stay fully transparent so the area outside the rounded
-            # .app-window does not paint a rectangular backing layer underneath the Qt frame.
-            web_view.page().setBackgroundColor(QColor(0, 0, 0, 0))
+            self._ui_debug_state("refresh_web_view_surface.start", include_dom=False)
+            self._set_web_view_opaque_input_surface("refresh_web_view_surface")
+            # Native HRGN clips the WebEngine HWND to the rounded frame; a themed
+            # backing color prevents transparent Chromium damage holes from showing
+            # the grey parent surface during startup/ESP32 update bursts.
+            self._apply_web_view_backing()
             web_view.update()
             self.update()
-            web_view.page().runJavaScript("""
+            if opacity_nudge:
+                web_view.page().runJavaScript("""
 (function(){
-  document.documentElement.style.background = 'transparent';
-  document.body.style.background = 'transparent';
+  document.documentElement.style.background = 'var(--proekt1-window-bg, #121431)';
+  document.body.style.background = 'var(--proekt1-window-bg, #121431)';
   document.body.classList.remove('fullscreen');
   var win = document.getElementById('app-window');
   if (win) {
     win.style.left = '';
     win.style.top = '';
-    win.style.transform = 'translateZ(0)';
-    win.style.backfaceVisibility = 'hidden';
+    // Force a compositor repaint via opacity nudge.
+    // NOTE: we do NOT set win.style.transform here because the runtime CSS has
+    // 'transform:... !important' which overrides any non-!important inline style,
+    // making the translateZ(0) trick ineffective. Opacity is not !important in
+    // the CSS, so the inline value sticks long enough to kick the compositor.
+    win.style.opacity = '0.9999';
+    void win.getBoundingClientRect();
     requestAnimationFrame(function(){
-      win.style.transform = '';
-      win.style.backfaceVisibility = '';
+      win.style.opacity = '';
     });
   }
 })();
 """)
+            else:
+                web_view.page().runJavaScript("""
+(function(){
+  document.documentElement.style.background = 'var(--proekt1-window-bg, #121431)';
+  document.body.style.background = 'var(--proekt1-window-bg, #121431)';
+  document.body.classList.remove('fullscreen');
+})();
+""")
+            QTimer.singleShot(0, lambda: self._ui_debug_state("refresh_web_view_surface.after_0ms", include_dom=True))
         except Exception:
             pass
 
@@ -5983,49 +6536,223 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
-    def _reapply_translucent_window(self):
-        """Re-assert per-pixel alpha + DWM corner/border attributes on MainWindow.
+    def _set_main_window_opaque_hit_surface(self, reason: str = ""):
+        try:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+            self.setAutoFillBackground(True)
+            color = self._web_surface_backing_color()
+            self.setStyleSheet(f"QMainWindow#mainWindow {{ background: {color}; border: none; }}")
+        except Exception:
+            color = "#121431"
+        if os.name == 'nt':
+            try:
+                hwnd = int(self.winId())
+                self._clear_native_click_through_style(hwnd, "main_opaque:" + str(reason or ""))
+                self._clear_native_layered_style(hwnd, "main_opaque:" + str(reason or ""))
+            except Exception:
+                pass
+        try:
+            self._ui_debug_log(
+                "window.hit_surface.opaque",
+                reason=str(reason or ""),
+                color=str(color),
+                hwnd=self._ui_debug_hwnd(int(self.winId())) if os.name == 'nt' else None,
+                translucent=bool(self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)),
+            )
+        except Exception:
+            pass
 
-        After `showFullScreen()` / `showNormal()` Qt on Windows can drop the
-        `WS_EX_LAYERED` extended style and DWM resets the corner preference to
-        the system default (rounded). That makes the area outside the 24px
-        Qt rounded fillPath suddenly OPAQUE / rounded with the smaller DWM
-        radius, producing visible "full corners" around the application.
-        Re-applying `WA_TranslucentBackground` forces Qt to put the layered
-        style back, and `apply_windows_backdrop()` re-asserts DONOTROUND +
-        no native border.
+    def _reapply_translucent_window(self):
+        """Compatibility shim: keep the main HWND opaque for reliable hit-testing.
+
+        The old corner fix re-enabled per-pixel alpha on the top-level window.
+        With QWebEngineView that can make the web-only center transparent to
+        Windows hit-test after UI scale/DPI changes. Rounded corners are now
+        provided by SetWindowRgn on the main HWND and the WebEngine HWND.
         """
-        try:
-            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-            self.setAutoFillBackground(False)
-        except Exception:
-            pass
-        try:
-            apply_windows_backdrop(self)
-        except Exception:
-            pass
-        try:
-            central = self.centralWidget()
-            if central is not None:
-                central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-                central.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-                central.setAutoFillBackground(False)
-                central.update()
-            self.update()
-        except Exception:
-            pass
+        self._set_main_window_opaque_hit_surface("reapply_translucent_window")
 
     def showEvent(self, event):  # type: ignore[override]
         super().showEvent(event)
         try:
+            self._ui_debug_state("showEvent.start", include_dom=False)
+            self._set_main_window_opaque_hit_surface("showEvent")
             apply_windows_backdrop(self)
             self._apply_rounded_mask()
             self.update()
+            QTimer.singleShot(0, self._refresh_dpi_dependent_layout)
+            QTimer.singleShot(200, self._refresh_dpi_dependent_layout)
+            QTimer.singleShot(40, lambda: self._recover_web_view_after_show("showEvent.40ms"))
+            QTimer.singleShot(260, lambda: self._recover_web_view_after_show("showEvent.260ms"))
+            QTimer.singleShot(0, lambda: self._ui_debug_state("showEvent.after_0ms", include_dom=True))
+            QTimer.singleShot(250, lambda: self._ui_debug_state("showEvent.after_250ms", include_dom=True))
         except Exception:
             pass
 
+    def _recover_web_view_after_show(self, reason: str = "showEvent"):
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None or not bool(getattr(self, '_web_ready', False)) or not web_view.isVisible():
+                return
+            now = time.monotonic()
+            last_at = float(getattr(self, '_web_restore_repaint_last_at', 0.0) or 0.0)
+            if now - last_at < 0.18:
+                return
+            self._web_restore_repaint_last_at = now
+            cw = self.centralWidget()
+            rect = cw.rect() if cw is not None else self.rect()
+            self._ui_debug_log("web.restore_repaint.start", reason=str(reason or ""), rect=self._ui_debug_rect(rect))
+            self._set_web_view_geometry_stable(
+                rect,
+                str(reason or "showEvent") + ".restore_repaint",
+                sync_fit=True,
+                reset_clip=True,
+                raise_view=True,
+            )
+            self._apply_web_view_backing()
+            self._apply_web_view_native_round_rgn()
+            self._force_web_view_native_redraw()
+            try:
+                web_view.page().runJavaScript("""
+(function(){
+  window.dispatchEvent(new Event('resize'));
+  const win = document.getElementById('app-window');
+  if (win) {
+    win.style.setProperty('--proekt1-restore-paint', String(performance.now()));
+    void win.offsetHeight;
+  }
+  return true;
+})();
+""")
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                self._ui_debug_log("web.restore_repaint.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+
+    def _clear_native_click_through_style(self, hwnd_int: int, reason: str = ""):
+        if os.name != 'nt' or not hwnd_int:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            try:
+                get_long_ptr = user32.GetWindowLongPtrW
+                set_long_ptr = user32.SetWindowLongPtrW
+            except AttributeError:
+                get_long_ptr = user32.GetWindowLongW
+                set_long_ptr = user32.SetWindowLongW
+            get_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long_ptr.restype = ctypes.c_ssize_t
+            set_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            set_long_ptr.restype = ctypes.c_ssize_t
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            ex_style = int(get_long_ptr(wintypes.HWND(int(hwnd_int)), GWL_EXSTYLE))
+            if ex_style & WS_EX_TRANSPARENT:
+                new_style = int(ex_style & ~WS_EX_TRANSPARENT)
+                set_long_ptr(wintypes.HWND(int(hwnd_int)), GWL_EXSTYLE, ctypes.c_ssize_t(new_style))
+                self._ui_debug_log(
+                    "window.hit_test.clear_transparent_style",
+                    reason=str(reason or ""),
+                    hwnd=hex(int(hwnd_int)),
+                    fromExStyle=hex(ex_style & 0xFFFFFFFFFFFFFFFF),
+                    toExStyle=hex(new_style & 0xFFFFFFFFFFFFFFFF),
+                )
+        except Exception as exc:
+            try:
+                self._ui_debug_log("window.hit_test.clear_transparent_style.error", reason=str(reason or ""), hwnd=hex(int(hwnd_int)), error=str(exc))
+            except Exception:
+                pass
+
+    def _clear_native_layered_style(self, hwnd_int: int, reason: str = ""):
+        if os.name != 'nt' or not hwnd_int:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            try:
+                get_long_ptr = user32.GetWindowLongPtrW
+                set_long_ptr = user32.SetWindowLongPtrW
+            except AttributeError:
+                get_long_ptr = user32.GetWindowLongW
+                set_long_ptr = user32.SetWindowLongW
+            get_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long_ptr.restype = ctypes.c_ssize_t
+            set_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            set_long_ptr.restype = ctypes.c_ssize_t
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            ex_style = int(get_long_ptr(wintypes.HWND(int(hwnd_int)), GWL_EXSTYLE))
+            if not (ex_style & WS_EX_LAYERED):
+                return
+            new_style = int(ex_style & ~WS_EX_LAYERED)
+            set_long_ptr(wintypes.HWND(int(hwnd_int)), GWL_EXSTYLE, ctypes.c_ssize_t(new_style))
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            user32.SetWindowPos(
+                wintypes.HWND(int(hwnd_int)),
+                wintypes.HWND(0),
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            self._ui_debug_log(
+                "window.hit_test.clear_layered_style",
+                reason=str(reason or ""),
+                hwnd=hex(int(hwnd_int)),
+                fromExStyle=hex(ex_style & 0xFFFFFFFFFFFFFFFF),
+                toExStyle=hex(new_style & 0xFFFFFFFFFFFFFFFF),
+            )
+        except Exception as exc:
+            try:
+                self._ui_debug_log("window.hit_test.clear_layered_style.error", reason=str(reason or ""), hwnd=hex(int(hwnd_int)), error=str(exc))
+            except Exception:
+                pass
+
+    def _clear_native_click_through_tree(self, hwnd_int: int, reason: str = ""):
+        if os.name != 'nt' or not hwnd_int:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnds = [int(hwnd_int)]
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def _enum_child(child_hwnd, _lparam):
+                if len(hwnds) >= 80:
+                    return False
+                hwnds.append(int(child_hwnd))
+                return True
+
+            callback = WNDENUMPROC(_enum_child)
+            user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+            user32.EnumChildWindows.restype = wintypes.BOOL
+            user32.EnumChildWindows(wintypes.HWND(int(hwnd_int)), callback, 0)
+            for index, hwnd in enumerate(hwnds):
+                self._clear_native_click_through_style(hwnd, f"{reason}[{index}]")
+            self._ui_debug_log(
+                "window.hit_test.clear_tree",
+                reason=str(reason or ""),
+                root=hex(int(hwnd_int)),
+                count=len(hwnds),
+            )
+        except Exception as exc:
+            try:
+                self._ui_debug_log("window.hit_test.clear_tree.error", reason=str(reason or ""), hwnd=hex(int(hwnd_int)), error=str(exc))
+            except Exception:
+                pass
+
     def _apply_rounded_mask(self):
+        self._set_main_window_opaque_hit_surface("apply_rounded_mask")
         try:
             self.clearMask()
         except Exception:
@@ -6034,7 +6761,49 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             try:
                 hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
-                user32.SetWindowRgn(wintypes.HWND(hwnd), 0, True)
+                self._clear_native_click_through_style(hwnd, "main_window")
+                user32.SetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+                user32.SetWindowRgn.restype = ctypes.c_int
+                if self.isFullScreen():
+                    result = user32.SetWindowRgn(wintypes.HWND(hwnd), 0, True)
+                    self._ui_debug_log("window.hit_region.clear.fullscreen", result=int(result), hwnd=self._ui_debug_hwnd(hwnd))
+                else:
+                    gdi32 = ctypes.windll.gdi32
+                    rect = wintypes.RECT()
+                    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+                    user32.GetClientRect.restype = wintypes.BOOL
+                    if not user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                        return
+                    width = max(1, int(rect.right - rect.left))
+                    height = max(1, int(rect.bottom - rect.top))
+                    design_w = max(1, int(getattr(self, '_design_window_w', 1100)))
+                    design_h = max(1, int(getattr(self, '_design_window_h', 760)))
+                    visual_scale = max(0.25, min(4.0, min(width / float(design_w), height / float(design_h))))
+                    radius_diam = max(1, int(round(48 * visual_scale)))
+                    gdi32.CreateRoundRectRgn.argtypes = [
+                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int,
+                    ]
+                    gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+                    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+                    gdi32.DeleteObject.restype = wintypes.BOOL
+                    rgn = gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius_diam, radius_diam)
+                    result = 0
+                    if rgn:
+                        result = int(user32.SetWindowRgn(wintypes.HWND(hwnd), rgn, True))
+                        if not result:
+                            try:
+                                gdi32.DeleteObject(rgn)
+                            except Exception:
+                                pass
+                    self._ui_debug_log(
+                        "window.hit_region.apply.done",
+                        result=int(result),
+                        native={"w": width, "h": height},
+                        visualScale=visual_scale,
+                        radiusDiam=radius_diam,
+                        hwnd=self._ui_debug_hwnd(hwnd),
+                    )
             except Exception:
                 pass
         self._set_native_corner_preference(not self.isFullScreen())
@@ -6050,6 +6819,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         hotkey (Win+Shift+S) indirectly causes via desktop recomposition — and
         it clears the stale corner pixels reliably.
         """
+        self._ui_debug_state("force_native_redraw.start", include_dom=False)
         if os.name != 'nt':
             try:
                 self.update()
@@ -6093,6 +6863,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_ERASE,
             )
             user32.InvalidateRect(hwnd, None, True)
+            self._ui_debug_log("force_native_redraw.win32.done", hwnd=self._ui_debug_hwnd(int(self.winId())))
         except Exception:
             pass
         try:
@@ -6118,6 +6889,795 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
+    def _force_web_view_native_redraw(self):
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None:
+            return
+        self._ui_debug_state("force_web_view_native_redraw.start", include_dom=False)
+        if os.name != 'nt':
+            try:
+                web_view.update()
+            except Exception:
+                pass
+            return
+        try:
+            hwnd = wintypes.HWND(int(web_view.winId()))
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.RedrawWindow.argtypes = [
+                wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+            ]
+            user32.RedrawWindow.restype = wintypes.BOOL
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            user32.SetWindowPos(
+                hwnd, wintypes.HWND(0), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            RDW_INVALIDATE = 0x0001
+            RDW_ALLCHILDREN = 0x0080
+            RDW_UPDATENOW = 0x0100
+            RDW_ERASE = 0x0004
+            user32.RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_ERASE)
+            self._ui_debug_log("force_web_view_native_redraw.win32.done", webHwnd=self._ui_debug_hwnd(int(web_view.winId())))
+        except Exception:
+            pass
+        try:
+            web_view.update()
+        except Exception:
+            pass
+
+    def _force_web_view_surface_rebuild(self):
+        web_view = getattr(self, 'web_view', None)
+        cw = self.centralWidget()
+        if web_view is None or cw is None:
+            return
+        try:
+            self._ui_debug_state("force_web_view_surface_rebuild.start", include_dom=True)
+            self._ui_debug_native_visual_probe("force_web_view_surface_rebuild.before", include_tree=True)
+            rect = cw.rect()
+            if rect.width() <= 0 or rect.height() <= 0:
+                self._ui_debug_log("force_web_view_surface_rebuild.skip", reason="empty_rect", rect=self._ui_debug_rect(rect))
+                return
+            high_dpi = self._screen_dpi_scale() > 1.01 or float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0) < 0.999
+            if high_dpi:
+                self._suppress_web_view_native_round_rgn("force_web_view_surface_rebuild", ms=760)
+            else:
+                self._apply_web_view_native_round_rgn()
+            self._set_web_view_opaque_input_surface("force_web_view_surface_rebuild")
+            self._apply_web_view_backing()
+            if not web_view.isVisible():
+                web_view.show()
+            web_view.raise_()
+            if high_dpi:
+                self._set_web_view_geometry_stable(
+                    rect,
+                    "force_web_view_surface_rebuild",
+                    sync_fit=True,
+                    reset_clip=True,
+                    raise_view=True,
+                )
+            else:
+                # Nudge only QWebEngineView geometry on 100% DPI. On mixed-DPI
+                # Windows can apply the child HWND move in monitor-local
+                # coordinates, so high-DPI uses Win32 child pinning instead.
+                if rect.width() > 2:
+                    web_view.setGeometry(rect.adjusted(0, 0, -1, 0))
+                elif rect.height() > 2:
+                    web_view.setGeometry(rect.adjusted(0, 0, 0, -1))
+                web_view.setGeometry(rect)
+            self._sync_actual_web_fit_factor()
+            self._ui_debug_native_visual_probe("force_web_view_surface_rebuild.after_geometry", include_tree=True)
+            if high_dpi:
+                self._ui_debug_log("force_web_view_surface_rebuild.high_dpi_soft", dpiFit=float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0), screenDpiScale=float(self._screen_dpi_scale()), noJsOpacityRefresh=True)
+                web_view.update()
+                self.update()
+                QTimer.singleShot(40, lambda: self._pin_web_view_native_chain("force_web_view_surface_rebuild.pin_40ms"))
+                QTimer.singleShot(140, lambda: self._pin_web_view_native_chain("force_web_view_surface_rebuild.pin_140ms"))
+                QTimer.singleShot(320, lambda: self._pin_web_view_native_chain("force_web_view_surface_rebuild.pin_320ms"))
+                self._schedule_web_view_native_round_rgn_reapply("force_web_view_surface_rebuild")
+            else:
+                self._refresh_web_view_surface()
+                self._force_web_view_native_redraw()
+                self._force_native_redraw()
+            QTimer.singleShot(0, lambda: self._ui_debug_state("force_web_view_surface_rebuild.after_0ms", include_dom=True))
+            QTimer.singleShot(0, lambda: self._ui_debug_native_visual_probe("force_web_view_surface_rebuild.after_0ms", include_tree=True))
+            QTimer.singleShot(160, lambda: self._ui_debug_native_visual_probe("force_web_view_surface_rebuild.after_160ms", include_tree=False))
+            QTimer.singleShot(520, lambda: self._ui_debug_native_visual_probe("force_web_view_surface_rebuild.after_520ms", include_tree=False))
+            if high_dpi:
+                QTimer.singleShot(260, lambda: self._verify_web_view_native_surface("surface_rebuild.after_260ms"))
+                QTimer.singleShot(760, lambda: self._verify_web_view_native_surface("surface_rebuild.after_760ms"))
+        except Exception:
+            pass
+
+    def _pin_web_view_native_chain(self, reason: str = "") -> dict:
+        data = {"reason": str(reason or "")}
+        if os.name != 'nt':
+            data["skipped"] = "non_windows"
+            return data
+        try:
+            if (
+                not bool(getattr(self, '_web_fs_active', False))
+                and (
+                    bool(getattr(self, '_native_drag_active', False))
+                    or self._is_left_mouse_button_down()
+                )
+            ):
+                data["skipped"] = "live_drag"
+                data["mouse"] = self._ui_debug_mouse()
+                self._ui_debug_log("web.native_chain.pin.skip", status=data)
+                return data
+        except Exception:
+            pass
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None:
+            data["skipped"] = "missing_web_view"
+            return data
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetClientRect.restype = wintypes.BOOL
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            main_hwnd = int(self.winId())
+            web_hwnd = int(web_view.winId())
+            chain = []
+            seen = set()
+            hwnd = web_hwnd
+            while hwnd and hwnd not in seen and hwnd != main_hwnd:
+                seen.add(hwnd)
+                parent = int(user32.GetParent(wintypes.HWND(hwnd)) or 0)
+                chain.append({"hwnd": hwnd, "parent": parent})
+                if not parent or parent == hwnd:
+                    break
+                hwnd = parent
+            data["chain"] = [
+                {"hwnd": hex(item["hwnd"]), "parent": hex(item["parent"]) if item["parent"] else None}
+                for item in chain
+            ]
+            data["reachedMain"] = bool(hwnd == main_hwnd)
+            if not data["reachedMain"]:
+                data["skipped"] = "parent_chain_not_in_main_window"
+                self._ui_debug_log("web.native_chain.pin.skip", status=data)
+                return data
+            metrics = self._web_view_expected_native_metrics(web_view, web_hwnd, web_hwnd)
+            target_w = int(metrics.get("nativeW", max(1, int(web_view.width()))) or max(1, int(web_view.width())))
+            target_h = int(metrics.get("nativeH", max(1, int(web_view.height()))) or max(1, int(web_view.height())))
+            expected_scale = float(metrics.get("expectedScale", 1.0) or 1.0)
+            logical_w = max(1, int(metrics.get("logicalW", web_view.width()) or web_view.width()))
+            logical_h = max(1, int(metrics.get("logicalH", web_view.height()) or web_view.height()))
+            data["target"] = {
+                "w": target_w,
+                "h": target_h,
+                "expectedScale": expected_scale,
+                "scaleSources": metrics.get("scaleSources"),
+                "client": metrics.get("client"),
+            }
+            applied = []
+            flags = 0x0004 | 0x0010 | 0x0200  # SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+            compact_live_pin = (not bool(getattr(self, '_ui_debug_deep', False))) and ("poll.still_down" in str(reason or ""))
+            for item in reversed(chain):
+                hwnd_i = int(item.get("hwnd") or 0)
+                parent_i = int(item.get("parent") or 0)
+                if not hwnd_i or not parent_i:
+                    continue
+                rect = wintypes.RECT()
+                ok_rect = bool(user32.GetClientRect(wintypes.HWND(parent_i), ctypes.byref(rect)))
+                width = int(rect.right - rect.left) if ok_rect else 0
+                height = int(rect.bottom - rect.top) if ok_rect else 0
+                parent_rect_accepted = False
+                if width > 0 and height > 0:
+                    scale_x = width / float(logical_w)
+                    scale_y = height / float(logical_h)
+                    parent_rect_accepted = bool(
+                        abs(scale_x - expected_scale) <= 0.25
+                        and abs(scale_y - expected_scale) <= 0.25
+                    )
+                if not parent_rect_accepted:
+                    width = target_w
+                    height = target_h
+                ok_pos = bool(user32.SetWindowPos(wintypes.HWND(hwnd_i), wintypes.HWND(0), 0, 0, int(width), int(height), flags))
+                applied.append({"hwnd": hex(hwnd_i), "parent": hex(parent_i), "w": int(width), "h": int(height), "ok": ok_pos, "parentRectAccepted": bool(parent_rect_accepted)})
+            data["applied"] = applied
+            try:
+                cw = self.centralWidget()
+                if (
+                    cw is not None
+                    and not bool(getattr(self, '_web_fs_active', False))
+                    and not bool(getattr(self, '_native_drag_active', False))
+                    and int(cw.width()) > 1
+                    and int(cw.height()) > 1
+                    and web_view.geometry() != cw.rect()
+                ):
+                    before_geom = web_view.geometry()
+                    web_view.setGeometry(cw.rect())
+                    data["qtGeometryRestored"] = {
+                        "from": self._ui_debug_rect(before_geom),
+                        "to": self._ui_debug_rect(cw.rect()),
+                    }
+            except Exception as exc:
+                data["qtGeometryRestoreError"] = str(exc)
+            if compact_live_pin:
+                data["compact"] = True
+            else:
+                data["webAfter"] = self._ui_debug_hwnd(web_hwnd)
+            self._ui_debug_log("web.native_chain.pin", status=data)
+        except Exception as exc:
+            data["error"] = str(exc)
+            self._ui_debug_log("web.native_chain.pin.error", status=data)
+        return data
+
+    def _web_view_live_native_pin_allowed(self, screen=None) -> bool:
+        """Allow live WebEngine HWND position repair only for the DPR>1 drag gap.
+
+        On DPR=1 the deferred post-release pin is safer. On DPR>1, Windows may
+        resize Chromium's native HWND to physical pixels while leaving it at a
+        stale screen origin until mouse release; a guarded position-only repair
+        keeps the visible surface attached without changing native sizes.
+        """
+        try:
+            if bool(getattr(self, '_web_fs_active', False)):
+                return False
+            if not (bool(getattr(self, '_native_drag_active', False)) or self._is_left_mouse_button_down()):
+                return False
+            if self._screen_dpi_scale(screen) > 1.01:
+                return True
+            web_view = getattr(self, 'web_view', None)
+            if web_view is not None:
+                try:
+                    if float(web_view.devicePixelRatioF()) > 1.01:
+                        return True
+                except Exception:
+                    pass
+                if os.name == 'nt':
+                    try:
+                        user32 = ctypes.windll.user32
+                        user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+                        user32.GetDpiForWindow.restype = wintypes.UINT
+                        dpi = int(user32.GetDpiForWindow(wintypes.HWND(int(web_view.winId()))))
+                        if dpi > 96:
+                            return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    def _pin_web_view_native_chain_position_only(self, reason: str = "") -> dict:
+        data = {"reason": str(reason or "")}
+        if os.name != 'nt':
+            data["skipped"] = "non_windows"
+            return data
+        if bool(getattr(self, '_web_fs_active', False)):
+            data["skipped"] = "fullscreen"
+            return data
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None:
+            data["skipped"] = "missing_web_view"
+            return data
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+            user32.ClientToScreen.restype = wintypes.BOOL
+            main_hwnd = int(self.winId())
+            web_hwnd = int(web_view.winId())
+            chain = []
+            seen = set()
+            hwnd = web_hwnd
+            while hwnd and hwnd not in seen and hwnd != main_hwnd:
+                seen.add(hwnd)
+                parent = int(user32.GetParent(wintypes.HWND(hwnd)) or 0)
+                chain.append({"hwnd": hwnd, "parent": parent})
+                if not parent or parent == hwnd:
+                    break
+                hwnd = parent
+            data["chain"] = [
+                {"hwnd": hex(item["hwnd"]), "parent": hex(item["parent"]) if item["parent"] else None}
+                for item in chain
+            ]
+            data["reachedMain"] = bool(hwnd == main_hwnd)
+            if not data["reachedMain"]:
+                data["skipped"] = "parent_chain_not_in_main_window"
+                self._ui_debug_log("web.native_chain.position.skip", status=data)
+                return data
+            try:
+                main_pt = wintypes.POINT(0, 0)
+                web_pt = wintypes.POINT(0, 0)
+                ok_main = bool(user32.ClientToScreen(wintypes.HWND(main_hwnd), ctypes.byref(main_pt)))
+                ok_web = bool(user32.ClientToScreen(wintypes.HWND(web_hwnd), ctypes.byref(web_pt)))
+                if ok_main and ok_web:
+                    delta_x = int(web_pt.x - main_pt.x)
+                    delta_y = int(web_pt.y - main_pt.y)
+                    data["originDelta"] = {"x": delta_x, "y": delta_y}
+                    if abs(delta_x) <= 2 and abs(delta_y) <= 2:
+                        data["skipped"] = "already_aligned"
+                        self._ui_debug_log("web.native_chain.position.skip", status=data)
+                        return data
+            except Exception:
+                pass
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_NOOWNERZORDER = 0x0200
+            flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+            applied = []
+            for item in reversed(chain):
+                hwnd_i = int(item.get("hwnd") or 0)
+                if not hwnd_i:
+                    continue
+                ok_pos = bool(user32.SetWindowPos(
+                    wintypes.HWND(hwnd_i),
+                    wintypes.HWND(0),
+                    0, 0, 0, 0,
+                    flags,
+                ))
+                applied.append({"hwnd": hex(hwnd_i), "ok": ok_pos})
+            data["applied"] = applied
+            if bool(getattr(self, '_ui_debug_deep', False)):
+                data["webAfter"] = self._ui_debug_hwnd(web_hwnd)
+            self._ui_debug_log("web.native_chain.position", status=data)
+        except Exception as exc:
+            data["error"] = str(exc)
+            self._ui_debug_log("web.native_chain.position.error", status=data)
+        return data
+
+    def _web_surface_needs_native_pin(self) -> bool:
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return False
+            if self._screen_dpi_scale() > 1.01:
+                return True
+            if float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0) < 0.999:
+                return True
+            try:
+                if float(web_view.devicePixelRatioF()) > 1.01:
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
+
+    def _schedule_web_view_native_pin_repair(self, reason: str, verify: bool = False):
+        try:
+            if os.name != 'nt' or not self._web_surface_needs_native_pin():
+                return
+            base = str(reason or "web.native_pin")
+            self._pin_web_view_native_chain(base + ".now")
+            QTimer.singleShot(40, lambda base=base: self._pin_web_view_native_chain(base + ".pin_40ms"))
+            QTimer.singleShot(140, lambda base=base: self._pin_web_view_native_chain(base + ".pin_140ms"))
+            QTimer.singleShot(320, lambda base=base: self._pin_web_view_native_chain(base + ".pin_320ms"))
+            if verify:
+                QTimer.singleShot(460, lambda base=base: self._verify_web_view_native_surface(base + ".verify_460ms"))
+        except Exception:
+            pass
+
+    def _interface_scale_surface_recovery_needed(self, screen=None) -> bool:
+        try:
+            if os.name != 'nt':
+                return False
+            ui_scale = float(self._interface_scale_factor())
+            if ui_scale >= 0.999:
+                return False
+            if screen is None:
+                screen = self._current_window_screen()
+            fit = float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0)
+            if ui_scale < 0.999 and fit >= 0.999 and self._web_engine_zoom_for_scale(fit) < 0.999:
+                return False
+            return bool(
+                self._screen_dpi_scale(screen) > 1.01
+                or fit < 0.999
+            )
+        except Exception:
+            return False
+
+    def _interface_scale_surface_recovery_key(self, screen=None) -> str:
+        try:
+            if screen is None:
+                screen = self._current_window_screen()
+            try:
+                screen_name = str(screen.name()) if screen is not None else "none"
+            except Exception:
+                screen_name = "unknown"
+            return "|".join([
+                str(int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100))),
+                screen_name,
+                f"{int(self.width())}x{int(self.height())}",
+                f"{float(self._screen_dpi_scale(screen)):.3f}",
+            ])
+        except Exception:
+            return str(time.monotonic())
+
+    def _kick_web_view_compositor_after_scale(self, reason: str):
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return
+            cw = self.centralWidget()
+            if cw is not None:
+                self._set_web_view_geometry_stable(
+                    cw.rect(),
+                    str(reason or "interface.scale") + ".compositor_kick",
+                    sync_fit=True,
+                    reset_clip=True,
+                    raise_view=True,
+                )
+            self._schedule_web_view_native_pin_repair(str(reason or "interface.scale") + ".compositor_kick", verify=False)
+            self._set_web_view_opaque_input_surface(str(reason or "interface.scale") + ".compositor_kick")
+            self._apply_web_view_backing()
+            web_view.update()
+            self.update()
+            web_view.page().runJavaScript("""
+(function(){
+  const root = document.documentElement;
+  const body = document.body;
+  const win = document.getElementById('app-window');
+  if (root) root.style.setProperty('--proekt1-compositor-kick', String(performance.now()));
+  if (root) root.style.background = 'var(--proekt1-window-bg, #121431)';
+  if (body) body.style.background = 'var(--proekt1-window-bg, #121431)';
+  if (win) {
+    win.style.willChange = 'transform, opacity';
+    void win.offsetHeight;
+    requestAnimationFrame(function(){
+      window.dispatchEvent(new Event('resize'));
+      requestAnimationFrame(function(){
+        if (win) win.style.willChange = '';
+      });
+    });
+  }
+  return true;
+})();
+""")
+            self._ui_debug_log("interface.scale.surface_recovery.kick", reason=str(reason or ""))
+        except Exception as exc:
+            try:
+                self._ui_debug_log("interface.scale.surface_recovery.kick.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+
+    def _schedule_interface_scale_surface_recovery(self, reason: str):
+        try:
+            screen = self._current_window_screen()
+            if not self._interface_scale_surface_recovery_needed(screen):
+                return
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None or not bool(getattr(self, '_web_ready', False)) or not web_view.isVisible():
+                self._ui_debug_log("interface.scale.surface_recovery.skip", reason=str(reason or ""), skip="not_ready_or_hidden")
+                return
+            if getattr(self, '_web_recreate_in_progress', False):
+                self._ui_debug_log("interface.scale.surface_recovery.skip", reason=str(reason or ""), skip="recreate_in_progress")
+                return
+            key = self._interface_scale_surface_recovery_key(screen)
+            now = time.monotonic()
+            last_key = str(getattr(self, '_interface_scale_surface_recovery_last_key', ""))
+            last_at = float(getattr(self, '_interface_scale_surface_recovery_last_at', 0.0) or 0.0)
+            if key == last_key and now - last_at < 3.0:
+                self._ui_debug_log("interface.scale.surface_recovery.skip", reason=str(reason or ""), skip="recent_same_state", key=key, elapsed=now - last_at)
+                return
+            self._interface_scale_surface_recovery_last_key = key
+            self._interface_scale_surface_recovery_last_at = now
+            base = str(reason or "interface.scale")
+            self._ui_debug_log(
+                "interface.scale.surface_recovery.schedule",
+                reason=base,
+                key=key,
+                percent=int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
+                dpiScale=float(self._screen_dpi_scale(screen)),
+            )
+
+            fallback_state = {"soft_rebuild": False, "recreate": False}
+
+            def _check_after_kick(check_label: str):
+                try:
+                    if getattr(self, '_web_recreate_in_progress', False):
+                        return
+                    if bool(fallback_state.get("recreate", False)):
+                        return
+                    status = self._web_view_visual_blank_status(base + "." + check_label)
+                    if bool(status.get("blank", False)) or bool(status.get("probeFailed", False)):
+                        if not bool(fallback_state.get("soft_rebuild", False)):
+                            fallback_state["soft_rebuild"] = True
+                            self._ui_debug_log("interface.scale.surface_recovery.soft_rebuild", reason=base, status=status)
+                            self._force_web_view_surface_rebuild()
+                            QTimer.singleShot(760, lambda: _check_after_kick("after_soft_rebuild_760ms"))
+                            return
+                        self._ui_debug_log("interface.scale.surface_recovery.defer_recreate", reason=base, status=status, action="pin_and_wait")
+                        self._schedule_web_view_native_pin_repair(base + ".visual_blank", verify=True)
+                        self._schedule_web_view_native_round_rgn_reapply(base + ".visual_blank")
+                        if not bool(fallback_state.get("held_once", False)):
+                            fallback_state["held_once"] = True
+                            QTimer.singleShot(1800, lambda: _check_after_kick("after_hold_1800ms"))
+                    else:
+                        self._ui_debug_log("interface.scale.surface_recovery.ok", reason=base, status=status)
+                except Exception as exc:
+                    try:
+                        self._ui_debug_log("interface.scale.surface_recovery.check.error", reason=base, error=str(exc))
+                    except Exception:
+                        pass
+
+            QTimer.singleShot(80, lambda base=base: self._kick_web_view_compositor_after_scale(base))
+            QTimer.singleShot(460, lambda: _check_after_kick("after_kick_460ms"))
+            QTimer.singleShot(1200, lambda: _check_after_kick("after_kick_1200ms"))
+        except Exception as exc:
+            try:
+                self._ui_debug_log("interface.scale.surface_recovery.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+
+    def _schedule_interface_scale_post_repaint(self, reason: str, previous_percent: Optional[int] = None):
+        """Wake WebEngine after a user scale resize, even on plain DPR=1 screens."""
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None or not bool(getattr(self, '_web_ready', False)) or not web_view.isVisible():
+                self._ui_debug_log(
+                    "interface.scale.post_repaint.skip",
+                    reason=str(reason or ""),
+                    skip="not_ready_or_hidden",
+                    previousPercent=previous_percent,
+                    percent=int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
+                )
+                return
+            if getattr(self, '_web_recreate_in_progress', False):
+                self._ui_debug_log("interface.scale.post_repaint.skip", reason=str(reason or ""), skip="recreate_in_progress")
+                return
+            base = str(reason or "interface.scale")
+            current_percent = int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100))
+            try:
+                prev_percent = int(self._sanitize_interface_scale_percent(previous_percent, current_percent))
+            except Exception:
+                prev_percent = current_percent
+            delays = (180,)
+            self._ui_debug_log(
+                "interface.scale.post_repaint.schedule",
+                reason=base,
+                previousPercent=previous_percent,
+                percent=current_percent,
+                direction="shrink" if prev_percent > current_percent else "grow_or_same",
+                delaysMs=list(delays),
+                window={"w": int(self.width()), "h": int(self.height())},
+                web={"w": int(web_view.width()), "h": int(web_view.height())},
+            )
+
+            def _run(label: str):
+                try:
+                    web = getattr(self, 'web_view', None)
+                    if web is None or not bool(getattr(self, '_web_ready', False)) or not web.isVisible():
+                        return
+                    self._ui_debug_log(
+                        "interface.scale.post_repaint.run",
+                        reason=base,
+                        label=label,
+                        previousPercent=previous_percent,
+                        percent=int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
+                    )
+                    try:
+                        web.setEnabled(True)
+                        self._set_web_view_opaque_input_surface(base + "." + label)
+                        self._apply_web_view_backing()
+                        web.setFocus(Qt.FocusReason.OtherFocusReason)
+                    except Exception:
+                        pass
+                    try:
+                        self._sync_actual_web_fit_factor()
+                    except Exception:
+                        pass
+                    try:
+                        self._apply_web_view_native_round_rgn()
+                    except Exception:
+                        pass
+                    try:
+                        web.update()
+                        self.update()
+                    except Exception:
+                        pass
+                    try:
+                        web.page().runJavaScript("window.dispatchEvent(new Event('resize'));")
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        self._ui_debug_log("interface.scale.post_repaint.error", reason=base, label=label, error=str(exc))
+                    except Exception:
+                        pass
+
+            for delay_ms in delays:
+                QTimer.singleShot(int(delay_ms), lambda delay_ms=delay_ms: _run(f"{int(delay_ms)}ms"))
+        except Exception as exc:
+            try:
+                self._ui_debug_log("interface.scale.post_repaint.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+
+    def _web_view_native_surface_status(self, reason: str = "") -> dict:
+        data = {"reason": str(reason or "")}
+        web_view = getattr(self, 'web_view', None)
+        if web_view is None:
+            data["ok"] = False
+            data["error"] = "missing_web_view"
+            return data
+        try:
+            data["webVisible"] = bool(web_view.isVisible())
+            data["webHidden"] = bool(web_view.isHidden())
+            data["webReady"] = bool(getattr(self, '_web_ready', False))
+            top_left = web_view.mapToGlobal(QPoint(0, 0))
+            center = web_view.mapToGlobal(QPoint(max(1, int(web_view.width())) // 2, max(1, int(web_view.height())) // 2))
+            data["qtWebGlobal"] = {"x": int(top_left.x()), "y": int(top_left.y()), "w": int(web_view.width()), "h": int(web_view.height())}
+            data["qtCenter"] = self._ui_debug_point(center)
+        except Exception as exc:
+            data["geometryError"] = str(exc)
+        if os.name != 'nt':
+            data["ok"] = True
+            return data
+        try:
+            user32 = ctypes.windll.user32
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            center = web_view.mapToGlobal(QPoint(max(1, int(web_view.width())) // 2, max(1, int(web_view.height())) // 2))
+            main_hwnd = int(self.winId())
+            web_hwnd = int(web_view.winId())
+            main_hwnd_info = self._ui_debug_hwnd(main_hwnd)
+            web_hwnd_info = self._ui_debug_hwnd(web_hwnd)
+            web_rect = (web_hwnd_info or {}).get("windowRect") or {}
+            if int(web_rect.get("w", 0) or 0) > 0 and int(web_rect.get("h", 0) or 0) > 0:
+                native_center = QPoint(
+                    int(web_rect.get("x", 0)) + int(web_rect.get("w", 0)) // 2,
+                    int(web_rect.get("y", 0)) + int(web_rect.get("h", 0)) // 2,
+                )
+            else:
+                native_center = center
+            data["nativeCenter"] = self._ui_debug_point(native_center)
+            hit = int(user32.WindowFromPoint(wintypes.POINT(int(native_center.x()), int(native_center.y()))) or 0)
+            root = int(user32.GetAncestor(wintypes.HWND(hit), 2) or 0) if hit else 0  # GA_ROOT
+            data["hit"] = self._ui_debug_hwnd(hit) if hit else None
+            data["hitRoot"] = hex(root) if root else None
+            data["mainHwnd"] = hex(main_hwnd)
+            data["webHwnd"] = web_hwnd_info
+            hit_ok = bool(hit and (hit == web_hwnd or (root == main_hwnd and hit != main_hwnd)))
+            web_root_ok = str((web_hwnd_info or {}).get("root", "")).lower() == hex(main_hwnd).lower()
+            main_rect = (main_hwnd_info or {}).get("windowRect") or {}
+            main_client = (main_hwnd_info or {}).get("clientRect") or {}
+            main_client_origin = (main_hwnd_info or {}).get("clientToScreen0") or {}
+            expected_positions = []
+            if "x" in main_client_origin and "y" in main_client_origin:
+                expected_positions.append((int(main_client_origin.get("x", 0)), int(main_client_origin.get("y", 0))))
+            if "x" in main_rect and "y" in main_rect:
+                expected_positions.append((int(main_rect.get("x", 0)), int(main_rect.get("y", 0))))
+            expected_sizes = []
+            if int(main_client.get("w", 0) or 0) > 0 and int(main_client.get("h", 0) or 0) > 0:
+                expected_sizes.append((int(main_client.get("w", 0)), int(main_client.get("h", 0))))
+            if int(main_rect.get("w", 0) or 0) > 0 and int(main_rect.get("h", 0) or 0) > 0:
+                expected_sizes.append((int(main_rect.get("w", 0)), int(main_rect.get("h", 0))))
+            wx = int(web_rect.get("x", 0) or 0)
+            wy = int(web_rect.get("y", 0) or 0)
+            ww = int(web_rect.get("w", 0) or 0)
+            wh = int(web_rect.get("h", 0) or 0)
+            pos_delta = min(((abs(wx - px), abs(wy - py)) for px, py in expected_positions), default=(999999, 999999))
+            size_delta = min(((abs(ww - sw), abs(wh - sh)) for sw, sh in expected_sizes), default=(999999, 999999))
+            geometry_ok = bool(web_root_ok and ww > 0 and wh > 0 and pos_delta[0] <= 4 and pos_delta[1] <= 4 and size_delta[0] <= 4 and size_delta[1] <= 4)
+            data["hitOk"] = hit_ok
+            data["nativeGeometry"] = {
+                "ok": geometry_ok,
+                "webRootOk": web_root_ok,
+                "posDelta": {"x": int(pos_delta[0]), "y": int(pos_delta[1])},
+                "sizeDelta": {"w": int(size_delta[0]), "h": int(size_delta[1])},
+                "mainClientToScreen0": main_client_origin,
+                "mainClientRect": main_client,
+                "mainWindowRect": main_rect,
+                "webWindowRect": web_rect,
+            }
+            # A child hit-test can still succeed while Chromium's HWND is half
+            # sized or double sized after a mixed-DPI move. Treat geometry as
+            # the source of truth so the repair path runs instead of accepting
+            # a 550x380 surface inside an 1100x760 app frame.
+            data["ok"] = bool(geometry_ok)
+            if not data["ok"]:
+                data["mismatch"] = {"hit": hex(hit) if hit else None, "hitRoot": hex(root) if root else None, "main": hex(main_hwnd), "web": hex(web_hwnd)}
+        except Exception as exc:
+            data["ok"] = False
+            data["error"] = str(exc)
+        return data
+
+    def _verify_web_view_native_surface(self, reason: str):
+        try:
+            if not bool(getattr(self, '_ui_debug_enabled', False)) and not (self._screen_dpi_scale() > 1.01 or float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0) < 0.999):
+                return
+            if getattr(self, '_web_recreate_in_progress', False):
+                self._ui_debug_log("web.native_surface.verify.skip", reason=str(reason), skip="recreate_in_progress")
+                return
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None or not bool(getattr(self, '_web_ready', False)) or not web_view.isVisible():
+                self._ui_debug_log("web.native_surface.verify.skip", reason=str(reason), skip="not_ready_or_hidden")
+                return
+            high_dpi = self._screen_dpi_scale() > 1.01 or float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0) < 0.999
+            if not high_dpi:
+                self._ui_debug_log("web.native_surface.verify.skip", reason=str(reason), skip="not_high_dpi")
+                return
+            status = self._web_view_native_surface_status(reason)
+            self._ui_debug_log("web.native_surface.verify", reason=str(reason), status=status)
+            if not bool(status.get("ok", False)):
+                self._pin_web_view_native_chain("verify_repair:" + str(reason))
+                repaired = self._web_view_native_surface_status(str(reason) + ".after_pin")
+                self._ui_debug_log("web.native_surface.verify.after_pin", reason=str(reason), status=repaired)
+                if not bool(repaired.get("ok", False)):
+                    self._ui_debug_log("web.native_surface.verify.defer_recreate", reason=str(reason), status=repaired, action="soft_rebuild")
+                    self._force_web_view_surface_rebuild()
+        except Exception as exc:
+            self._ui_debug_log("web.native_surface.verify.error", reason=str(reason), error=str(exc))
+
+    def _recreate_web_engine_view(self, reason: str):
+        try:
+            if getattr(self, '_web_recreate_in_progress', False):
+                self._ui_debug_log("web.recreate.skip", reason=str(reason), skip="already_in_progress")
+                return
+            now = time.monotonic()
+            last_at = float(getattr(self, '_web_recreate_last_at', 0.0) or 0.0)
+            if now - last_at < 2.0:
+                self._ui_debug_log("web.recreate.skip", reason=str(reason), skip="rate_limited", elapsed=now - last_at)
+                return
+            host = self.centralWidget()
+            if host is None:
+                self._ui_debug_log("web.recreate.skip", reason=str(reason), skip="missing_host")
+                return
+            self._web_recreate_in_progress = True
+            self._web_recreate_reason = str(reason)
+            self._web_recreate_last_at = now
+            self._web_ready = False
+            self._web_load_attempts = 0
+            self._ui_debug_log("web.recreate.start", reason=str(reason))
+            self._ui_debug_native_visual_probe("web.recreate.before", include_tree=True)
+            old_web_view = getattr(self, 'web_view', None)
+            if old_web_view is not None:
+                try:
+                    old_web_view.hide()
+                except Exception:
+                    pass
+                try:
+                    old_web_view.setParent(None)
+                except Exception:
+                    pass
+                try:
+                    old_web_view.deleteLater()
+                except Exception:
+                    pass
+            self.web_view = None
+            self._install_web_engine_ui(host)
+            try:
+                self._set_web_view_geometry_stable(
+                    host.rect(),
+                    "web.recreate.after_install",
+                    sync_fit=False,
+                    reset_clip=True,
+                    raise_view=True,
+                )
+            except Exception:
+                pass
+            self._ui_debug_state("web.recreate.after_install", include_dom=False)
+            self._ui_debug_native_visual_probe("web.recreate.after_install", include_tree=True)
+        except Exception as exc:
+            self._web_recreate_in_progress = False
+            self._ui_debug_log("web.recreate.error", reason=str(reason), error=str(exc))
+
     def _install_web_engine_ui(self, host: QWidget):
         self._web_bridge = _WebUiBridge(self)
         self._web_channel = QWebChannel(self)
@@ -6126,25 +7686,50 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self.web_view = _WebEngineChromeView(self, host)
         self.web_view.setObjectName("webEngineUi")
         self.web_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.web_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.web_view.setStyleSheet("background: transparent; border: none;")
+        self._set_web_view_opaque_input_surface("install_web_engine_ui")
+        self._apply_web_view_backing()
+        self._ui_debug_log("webengine.flags", chromium=os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", ""))
         # Use the mid-point of the _RoundedWindowFrame gradient so Chromium shows
         # the theme colour before the HTML page has painted anything, instead of
         # a white or transparent flash during GPU surface initialisation.
-        self.web_view.page().setBackgroundColor(QColor("#121431"))
         self.web_view.page().setWebChannel(self._web_channel)
+        try:
+            self.web_view.loadStarted.connect(lambda: self._ui_debug_state("web.loadStarted", include_dom=False))
+            self.web_view.loadProgress.connect(lambda progress: self._ui_debug_log("web.loadProgress", progress=int(progress)))
+            self.web_view.urlChanged.connect(lambda url: self._ui_debug_log("web.urlChanged", url=url.toString()))
+            self.web_view.titleChanged.connect(lambda title: self._ui_debug_log("web.titleChanged", title=str(title)))
+        except Exception:
+            pass
+        try:
+            self.web_view.page().renderProcessTerminated.connect(lambda *args: self._ui_debug_log("web.renderProcessTerminated", args=[str(a) for a in args]))
+        except Exception:
+            pass
         try:
             settings = self.web_view.settings()
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False)
         except Exception:
             pass
         try:
             self.web_view.page().fullScreenRequested.connect(self._on_web_fullscreen_requested)
         except Exception:
             pass
-        self.web_view.setGeometry(host.rect())
+        initial_rect = host.rect()
+        try:
+            if (
+                int(self.width()) > int(initial_rect.width())
+                and int(self.height()) > int(initial_rect.height())
+            ):
+                initial_rect = QRect(0, 0, int(self.width()), int(self.height()))
+        except Exception:
+            pass
+        self.web_view.setGeometry(initial_rect)
+        self._ui_debug_state("web.install.after_setGeometry", include_dom=False)
+        self._apply_dpi_window_metrics(QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen())
+        self._ui_debug_state("web.install.after_dpi_metrics", include_dom=False)
         self._reset_web_view_clip()
         # Keep web_view hidden until the page is ready so the lifecycle overlay
         # (which is a non-native QWidget and would be painted *behind* Chromium's
@@ -6156,6 +7741,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self.web_view.loadFinished.connect(self._on_web_engine_loaded)
 
         html_path = _design_preview_html_path()
+        self._ui_debug_log("web.load.request", html_path=html_path, exists=bool(os.path.exists(html_path)))
         if os.path.exists(html_path):
             self.web_view.load(QUrl.fromLocalFile(html_path))
         else:
@@ -6165,14 +7751,46 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 QUrl.fromLocalFile(os.path.dirname(os.path.abspath(__file__)) + os.sep)
             )
 
+    def _current_window_screen(self):
+        try:
+            fg = self.frameGeometry()
+            if fg.isValid():
+                screen = QApplication.screenAt(fg.center())
+                if screen is not None:
+                    return screen
+        except Exception:
+            pass
+        try:
+            g = self.geometry()
+            if g.isValid():
+                screen = QApplication.screenAt(g.center())
+                if screen is not None:
+                    return screen
+        except Exception:
+            pass
+        try:
+            handle = self.windowHandle()
+            screen = handle.screen() if handle is not None else None
+            if screen is not None:
+                return screen
+        except Exception:
+            pass
+        return QApplication.primaryScreen()
+
     def _on_web_fullscreen_requested(self, request):
         try:
             toggle_on = bool(request.toggleOn())
             request.accept()
         except Exception:
             return
+        self._set_web_fullscreen_active(toggle_on)
+
+    def _set_web_fullscreen_active(self, active: bool):
         try:
-            if toggle_on:
+            if active:
+                if getattr(self, '_web_fs_active', False):
+                    self._sync_web_fullscreen_state(True)
+                    return
                 # Save full state for clean restore. Do NOT call showFullScreen()
                 # or change windowState — on Windows that destroys the native peer
                 # and Qt loses WS_EX_LAYERED (per-pixel alpha), after which the
@@ -6191,10 +7809,18 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 except Exception:
                     pass
                 try:
-                    screen = self.screen() or QApplication.primaryScreen()
+                    screen = self._current_window_screen()
                     scr_geom = screen.geometry() if screen is not None else self.geometry()
                 except Exception:
                     scr_geom = self.geometry()
+                    screen = None
+                self._ui_debug_log(
+                    "web.fullscreen.enter.target",
+                    targetScreen=self._ui_debug_screen(screen),
+                    targetGeometry=self._ui_debug_rect(scr_geom),
+                    currentGeometry=self._ui_debug_rect(self.geometry()),
+                    currentFrameGeometry=self._ui_debug_rect(self.frameGeometry()),
+                )
                 if self.isMaximized():
                     # Leave the maximized state — just move the window above the taskbar
                     # to cover the full screen rect; Qt won't touch native styles.
@@ -6204,13 +7830,25 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                     except Exception:
                         pass
                 self.setGeometry(scr_geom)
+                try:
+                    cw = self.centralWidget()
+                    if cw is not None:
+                        self._set_web_view_geometry_stable(cw.rect(), "web.fullscreen.enter.sync")
+                except Exception:
+                    pass
                 self._sync_web_fullscreen_state(True)
+                self._schedule_web_view_native_pin_repair("web.fullscreen.enter", verify=False)
                 # Strip rounded HRGN from web_view HWND so the dark fullscreen
                 # backdrop fills the screen as a full rectangle (no rounded edges).
                 self._apply_web_view_native_round_rgn()
                 QTimer.singleShot(0, self._apply_web_view_native_round_rgn)
                 QTimer.singleShot(120, self._apply_web_view_native_round_rgn)
+                QTimer.singleShot(0, lambda: self._ui_debug_state("web.fullscreen.enter.after_0ms", include_dom=True))
+                QTimer.singleShot(160, lambda: self._ui_debug_state("web.fullscreen.enter.after_160ms", include_dom=True))
             else:
+                if not getattr(self, '_web_fs_active', False):
+                    self._sync_web_fullscreen_state(False)
+                    return
                 self._web_fs_active = False
                 self._sync_web_fullscreen_state(False)
                 geom = getattr(self, '_web_fs_restore_geometry', None)
@@ -6223,32 +7861,41 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 else:
                     if geom is not None:
                         self.setGeometry(geom)
+                        try:
+                            restore_rect = QRect(0, 0, int(geom.width()), int(geom.height()))
+                            self._set_web_view_geometry_stable(restore_rect, "web.fullscreen.exit.restore")
+                        except Exception:
+                            self._restore_web_view_to_central_rect("web.fullscreen.exit.restore.fallback")
+                        QTimer.singleShot(0, lambda: self._restore_web_view_to_central_rect("web.fullscreen.exit.restore.0ms"))
+                        QTimer.singleShot(80, lambda: self._restore_web_view_to_central_rect("web.fullscreen.exit.restore.80ms"))
                     self.ensure_visible()
-                self._reset_web_view_clip()
-                self._refresh_web_view_surface()
-                self._apply_rounded_mask()
-                self._force_native_redraw()
-                QTimer.singleShot(0, lambda: self._sync_web_fullscreen_state(False))
-                QTimer.singleShot(120, lambda: self._sync_web_fullscreen_state(False))
-                QTimer.singleShot(0, self._reset_web_view_clip)
-                QTimer.singleShot(120, self._reset_web_view_clip)
-                QTimer.singleShot(40, self._refresh_web_view_surface)
-                QTimer.singleShot(180, self._refresh_web_view_surface)
-                QTimer.singleShot(0, self._apply_rounded_mask)
-                QTimer.singleShot(120, self._apply_rounded_mask)
-                QTimer.singleShot(400, self._apply_rounded_mask)
-                QTimer.singleShot(0, self._force_native_redraw)
-                QTimer.singleShot(60, self._force_native_redraw)
-                QTimer.singleShot(180, self._force_native_redraw)
-                QTimer.singleShot(400, self._force_native_redraw)
-                # Heaviest hammer — 1px geometry nudge, which forces a full
-                # native repaint chain (Qt resizeEvent + Chromium GPU surface
-                # rebuild + DWM recomposition). This reliably clears any
-                # stale corner pixels left over from the fullscreen rect.
-                QTimer.singleShot(80, self._force_geometry_nudge)
-                QTimer.singleShot(260, self._force_geometry_nudge)
-        except Exception:
-            pass
+                high_dpi = self._screen_dpi_scale() > 1.01 or float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0) < 0.999
+                if high_dpi:
+                    self._ui_debug_log("web.fullscreen.exit.high_dpi_soft_restore", dpiFit=float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0), screenDpiScale=float(self._screen_dpi_scale()))
+                    self._apply_rounded_mask()
+                    self._schedule_web_view_native_pin_repair("web.fullscreen.exit.high_dpi", verify=True)
+                    QTimer.singleShot(0, lambda: self._sync_web_fullscreen_state(False))
+                    QTimer.singleShot(120, lambda: self._sync_web_fullscreen_state(False))
+                else:
+                    self._reset_web_view_clip()
+                    self._refresh_web_view_surface()
+                    self._apply_rounded_mask()
+                    self._force_native_redraw()
+                    QTimer.singleShot(0, lambda: self._sync_web_fullscreen_state(False))
+                    QTimer.singleShot(120, lambda: self._sync_web_fullscreen_state(False))
+                    QTimer.singleShot(0, self._reset_web_view_clip)
+                    QTimer.singleShot(120, self._reset_web_view_clip)
+                    QTimer.singleShot(40, self._refresh_web_view_surface)
+                    QTimer.singleShot(180, self._refresh_web_view_surface)
+                    QTimer.singleShot(0, self._apply_rounded_mask)
+                    QTimer.singleShot(120, self._apply_rounded_mask)
+                    QTimer.singleShot(400, self._apply_rounded_mask)
+                    QTimer.singleShot(0, self._force_native_redraw)
+                    QTimer.singleShot(60, self._force_native_redraw)
+                    QTimer.singleShot(180, self._force_native_redraw)
+                    QTimer.singleShot(400, self._force_native_redraw)
+                    # Keep fullscreen exit paint-only. A top-level 1px geometry
+                    # nudge is visible as a frame jump on mixed-DPI desktops.
         except Exception:
             pass
 
@@ -6264,7 +7911,26 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
+    def _restore_web_view_to_central_rect(self, reason: str = "web.restore.central"):
+        try:
+            if getattr(self, '_web_fs_active', False):
+                return
+            cw = self.centralWidget()
+            if cw is None:
+                return
+            self._set_web_view_geometry_stable(
+                cw.rect(),
+                str(reason or "web.restore.central"),
+                sync_fit=True,
+                reset_clip=True,
+                raise_view=True,
+            )
+        except Exception:
+            pass
+
     def _on_web_engine_loaded(self, ok: bool):
+        self._ui_debug_state("web.loadFinished", include_dom=True)
+        self._ui_debug_log("web.loadFinished.ok", ok=bool(ok))
         if not ok:
             # Race on quick app restart: Chromium child process may not be ready
             # yet, or the file:// load gets cancelled mid-flight. Retry a few
@@ -6302,32 +7968,55 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
   if (window.__PROEKT1_RUNTIME_READY__) return;
   window.__PROEKT1_RUNTIME_READY__ = true;
   document.body.classList.add('proekt1-runtime');
+    const __proekt1DeepDebug = __PROEKT1_DEEP_DEBUG__;
 
   const css = document.createElement('style');
   css.id = 'proekt1-runtime-css';
   css.textContent = `
+        :root { --proekt1-dpi-fit: 1; --proekt1-ui-scale: 1; --proekt1-dpi-fit-w: 1100px; --proekt1-dpi-fit-h: 760px; --proekt1-window-bg: #121431; }
         html, body { width:100%; height:100%; margin:0 !important; padding:0 !important; overflow:hidden !important; }
-        /* Page surface MUST be transparent in normal mode so only the rounded .app-window
-           is visible; otherwise a rectangular body fill peeks out from under the 24px corners. */
-        html, body.proekt1-runtime { background:transparent !important; }
+        /* The WebEngine HWND is clipped by a native rounded region, so the page
+           can stay opaque for reliable Windows hit-testing without rectangular corners. */
+        html, body.proekt1-runtime { background:var(--proekt1-window-bg,#121431) !important; }
     body.proekt1-runtime .legend, body.proekt1-runtime .names-panel { display:none !important; }
+        /* Base rule: keep the design surface at its canonical 1100x760 CSS pixels.
+           Python scales the WebEngine view/window around that base size. Avoid using
+           vw/vh here: after mixed-DPI moves Chromium can briefly report a physical
+           viewport, which stretches the app into a huge non-interactive dark panel. */
         body.proekt1-runtime .app-window {
-            width:100vw !important; height:100vh !important; left:0 !important; top:0 !important;
-            transform:none !important; box-shadow:none !important;
+            width:var(--proekt1-dpi-fit-w, 1100px) !important;
+            height:var(--proekt1-dpi-fit-h, 760px) !important;
+            left:0 !important; top:0 !important;
+            zoom:var(--proekt1-ui-scale, 1) !important;
+            transform:scale(var(--proekt1-dpi-fit, 1)) !important;
+            transform-origin:0 0 !important;
+            box-shadow:none !important;
+            border:0 !important;
             border-radius:24px !important; overflow:hidden !important;
             background-clip:padding-box !important;
             clip-path:inset(0 round 24px) !important;
-            will-change:clip-path, transform;
+            /* Kill the original transition: left/top/transform 0.25s ease so that any
+               (programmatic) position change snaps instantly without an animated slide. */
+            transition:none !important;
         }
-        /* Only fullscreen mode paints the dark backdrop behind the centered 1100x760 window.
+          /* DPI-fit marker: Python adds the class when the selected UI size needs
+              a forced down-fit; transform is only a fallback for fit/sub-100 scale. */
+        body.proekt1-runtime.dpi-fit-active .app-window {
+            will-change:auto !important;
+        }
+          /* Only fullscreen mode paints the dark backdrop behind the centered 1100x760 window.
            The color is controlled by the CSS variable --proekt1-fs-bg which is set from Python
-           (current theme's fullscreen_bg) on load and on every theme change. */
+              (current theme's fullscreen_bg) on load and on every theme change. Fullscreen keeps
+              the same forced down-fit scale so 150/200% UI does not overflow small/high-DPI screens. */
         body.proekt1-runtime.fullscreen, html:fullscreen body.proekt1-runtime { background:var(--proekt1-fs-bg,#08091a) !important; }
         body.proekt1-runtime.fullscreen .app-window,
         html:fullscreen body.proekt1-runtime .app-window {
             width:1100px !important; height:760px !important; left:50% !important; top:50% !important;
-            transform:translate(-50%, -50%) scale(1.2) !important;
+            zoom:var(--proekt1-ui-scale, 1) !important;
+            transform:translate(-50%, -50%) scale(var(--proekt1-dpi-fit, 1)) !important;
+            transform-origin:center center !important;
             box-shadow:0 40px 120px rgba(0,0,0,0.7) !important;
+            border:1px solid rgba(255,255,255,0.12) !important;
             border-radius:24px !important; overflow:hidden !important;
             background-clip:padding-box !important;
             clip-path:inset(0 round 24px) !important;
@@ -6382,7 +8071,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             if (toggles[idx]) toggles[idx].dataset.setting = key;
         });
         const dropdowns = Array.from(root.querySelectorAll('.set-dropdown'));
-        ['transport', 'theme', 'appLanguage', 'displayLang'].forEach((key, idx) => {
+        ['transport', 'theme', 'uiScale', 'appLanguage', 'displayLang'].forEach((key, idx) => {
             if (dropdowns[idx]) dropdowns[idx].dataset.setting = key;
         });
         const ledRange = root.querySelector('input.set-range[data-target="led-val"]');
@@ -6396,6 +8085,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         const kind = el?.dataset?.curveRange || '';
         if (kind === 'hyst') return value + '%';
         if (kind === 'delayOn' || kind === 'delayOff') return value + ' сек';
+        if (el?.dataset?.target === 'led-val' || el?.dataset?.target === 'oled-val') return Number(value) === 0 ? 'выкл.' : value + '%';
         return value;
     }
     function refreshCurveRange(el) {
@@ -6443,6 +8133,14 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
     const curveMapX = temp => ((clampCurveValue(temp, curveMinTemp, curveMaxTemp) - curveMinTemp) / (curveMaxTemp - curveMinTemp)) * 1000;
     const curveMapY = speed => 1000 - clampCurveValue(speed, 0, 100) * 10;
     const smoothCurveValue = value => Math.round(Number(value) * 100) / 100;
+    function curveRuntimeScale() {
+        const style = getComputedStyle(document.documentElement);
+        const read = name => {
+            const value = Number(style.getPropertyValue(name));
+            return Number.isFinite(value) && value > 0 ? value : 1;
+        };
+        return read('--proekt1-ui-scale') * read('--proekt1-dpi-fit');
+    }
     function roundedCurvePoint(point) {
         return [
             Math.round(clampCurveValue(point?.[0], curveMinTemp, curveMaxTemp)),
@@ -6457,13 +8155,22 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         const svgRect = svg.getBoundingClientRect();
         const plotRect = plotEl.getBoundingClientRect();
         if (!svgRect.width || !svgRect.height) return null;
+        const plotW = plotEl.offsetWidth || plotEl.clientWidth || plotRect.width || 1;
+        const plotH = plotEl.offsetHeight || plotEl.clientHeight || plotRect.height || 1;
+        const measuredScaleX = plotRect.width / plotW || 1;
+        const measuredScaleY = plotRect.height / plotH || 1;
+        const runtimeScale = curveRuntimeScale();
         _curveGeom = {
             svgLeft: svgRect.left,
             svgTop: svgRect.top,
             svgWidth: svgRect.width,
             svgHeight: svgRect.height,
             plotLeft: plotRect.left,
-            plotTop: plotRect.top
+            plotTop: plotRect.top,
+            plotWidth: plotW,
+            plotHeight: plotH,
+            plotScaleX: Math.abs(measuredScaleX - 1) > 0.001 ? measuredScaleX : runtimeScale,
+            plotScaleY: Math.abs(measuredScaleY - 1) > 0.001 ? measuredScaleY : runtimeScale
         };
         return _curveGeom;
     }
@@ -6529,42 +8236,40 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
     function curveSegmentD(from, to) {
         return 'M ' + curveMapX(from[0]).toFixed(1) + ' ' + curveMapY(from[1]).toFixed(1) + ' L ' + curveMapX(to[0]).toFixed(1) + ' ' + curveMapY(to[1]).toFixed(1);
     }
-    function hideCurvePreview() {
-        byId('curve-plot')?.classList.remove('is-previewing');
-        byId('curve-preview-before')?.setAttribute('d', '');
-        byId('curve-preview-after')?.setAttribute('d', '');
+    function clearCurveHoverCanvas() {
+        const canvas = byId('curve-hover-canvas');
+        if (!canvas || canvas.dataset.empty === 'true') return;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width || 1, canvas.height || 1);
+        canvas.dataset.previewKey = '';
+        canvas.dataset.empty = 'true';
     }
-    function hideCursorDot() {
-        byId('curve-cursor-dot')?.classList.remove('is-visible');
-        byId('curve-cursor-label')?.classList.remove('is-visible');
+    function prepareCurveHoverCanvas(geom = getCurveGeom()) {
+        const canvas = byId('curve-hover-canvas');
+        const plotEl = byId('curve-plot');
+        if (!canvas || !plotEl || !geom) return null;
+        const cssW = Math.max(1, Math.round(plotEl.offsetWidth || plotEl.clientWidth || geom.plotWidth || 1));
+        const cssH = Math.max(1, Math.round(plotEl.offsetHeight || plotEl.clientHeight || geom.plotHeight || 1));
+        const dpr = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+        const targetW = Math.max(1, Math.round(cssW * dpr));
+        const targetH = Math.max(1, Math.round(cssH * dpr));
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+            canvas.width = targetW;
+            canvas.height = targetH;
+            canvas.dataset.previewKey = '';
+            canvas.dataset.empty = 'true';
+        }
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+        return { canvas, ctx, cssW, cssH, dpr };
     }
-    function updateCursorDot(point, mode, geom = getCurveGeom()) {
-        const dot = byId('curve-cursor-dot');
-        const label = byId('curve-cursor-label');
-        if (!dot || !label || !geom || !point) { hideCursorDot(); return; }
-        const x = geom.svgLeft - geom.plotLeft + curveMapX(point[0]) / 1000 * geom.svgWidth;
-        const y = geom.svgTop  - geom.plotTop  + curveMapY(point[1]) / 1000 * geom.svgHeight;
-        dot.style.setProperty('--curve-x', x.toFixed(1) + 'px');
-        dot.style.setProperty('--curve-y', y.toFixed(1) + 'px');
-        dot.classList.toggle('is-pump', mode !== 'fan');
-        dot.classList.toggle('is-fan',  mode === 'fan');
-        dot.classList.add('is-visible');
-        label.style.setProperty('--curve-x', x.toFixed(1) + 'px');
-        label.style.setProperty('--curve-y', (y - 11).toFixed(1) + 'px');
-        const rounded = roundedCurvePoint(point);
-        const labelText = rounded[0] + '\u00b0C / ' + rounded[1] + '%';
-        if (label.textContent !== labelText) label.textContent = labelText;
-        label.classList.toggle('is-pump', mode !== 'fan');
-        label.classList.toggle('is-fan',  mode === 'fan');
-        label.classList.add('is-visible');
-    }
-    function previewCurvePoint(point, mode) {
-        const plot = byId('curve-plot');
-        const beforePath = byId('curve-preview-before');
-        const afterPath = byId('curve-preview-after');
+    function drawCurveHoverPreview(point, mode, geom = getCurveGeom()) {
         const points = getCurvePoints(mode);
-        if (!plot || !beforePath || !afterPath || !point || points.length >= 16) {
-            hideCurvePreview();
+        const prepared = prepareCurveHoverCanvas(geom);
+        if (!prepared || !point || points.length >= 16) {
+            clearCurveHoverCanvas();
             return;
         }
         let before = null;
@@ -6573,19 +8278,127 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             if (item[0] <= point[0]) before = item;
             else if (!after) after = item;
         });
-        const previewClass = 'curve-preview-path curve-preview-' + mode;
-        beforePath.setAttribute('class', previewClass);
-        afterPath.setAttribute('class', previewClass);
-        beforePath.setAttribute('d', before ? curveSegmentD(before, point) : '');
-        afterPath.setAttribute('d', after ? curveSegmentD(point, after) : '');
-        plot.classList.toggle('is-previewing', !!(before || after));
+        if (!before && !after) {
+            clearCurveHoverCanvas();
+            return;
+        }
+        const rounded = roundedCurvePoint(point);
+        const previewKey = mode + ':' + points.length + ':' + rounded[0] + ':' + rounded[1] + ':' +
+            (before ? before.join(',') : '-') + ':' + (after ? after.join(',') : '-');
+        const { canvas, ctx, dpr } = prepared;
+        if (canvas.dataset.previewKey === previewKey && canvas.dataset.empty !== 'true') return;
+        canvas.dataset.previewKey = previewKey;
+        canvas.dataset.empty = 'false';
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width || 1, canvas.height || 1);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const color = mode === 'fan' ? 'rgba(255,133,194,0.96)' : 'rgba(139,213,255,0.98)';
+        const glow = mode === 'fan' ? 'rgba(255,133,194,0.34)' : 'rgba(139,213,255,0.38)';
+        const drawSegment = (from, to) => {
+            const a = curveOverlayPosition(from, geom);
+            const b = curveOverlayPosition(to, geom);
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+        };
+        ctx.save();
+        ctx.lineWidth = 2.2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.setLineDash([10, 8]);
+        ctx.strokeStyle = color;
+        ctx.shadowBlur = 0;
+        if (before) drawSegment(before, point);
+        if (after) drawSegment(point, after);
+        ctx.restore();
+        const pos = curveOverlayPosition(point, geom);
+        ctx.save();
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 9;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = 1.4;
+        ctx.strokeStyle = 'rgba(255,255,255,0.88)';
+        ctx.stroke();
+        ctx.restore();
+        ctx.save();
+        ctx.font = '700 11px "JetBrains Mono", Consolas, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillStyle = mode === 'fan' ? 'rgba(255,133,194,0.86)' : 'rgba(139,213,255,0.86)';
+        ctx.shadowColor = 'rgba(0,0,0,0.82)';
+        ctx.shadowBlur = 6;
+        ctx.fillText(rounded[0] + '\u00b0C / ' + rounded[1] + '%', pos.x, Math.max(16, pos.y - 12));
+        ctx.restore();
+    }
+    function hideCurvePreview() {
+        clearCurveHoverCanvas();
+        byId('curve-plot')?.classList.remove('is-previewing');
+        byId('curve-preview-before')?.setAttribute('d', '');
+        byId('curve-preview-after')?.setAttribute('d', '');
+    }
+    function hideCursorDot() {
+        const dot = byId('curve-cursor-dot');
+        const label = byId('curve-cursor-label');
+        if (dot) {
+            dot.classList.remove('is-visible');
+            dot.dataset.cursorKey = '';
+        }
+        if (label) {
+            label.classList.remove('is-visible');
+            label.dataset.cursorKey = '';
+        }
+    }
+    function curveOverlayPosition(point, geom) {
+        const visualX = geom.svgLeft - geom.plotLeft + curveMapX(point[0]) / 1000 * geom.svgWidth;
+        const visualY = geom.svgTop - geom.plotTop + curveMapY(point[1]) / 1000 * geom.svgHeight;
+        return {
+            x: visualX / (geom.plotScaleX || 1),
+            y: visualY / (geom.plotScaleY || 1)
+        };
+    }
+    function updateCursorDot(point, mode, geom = getCurveGeom()) {
+        const dot = byId('curve-cursor-dot');
+        const label = byId('curve-cursor-label');
+        if (!dot || !label || !geom || !point) { hideCursorDot(); return; }
+        const pos = curveOverlayPosition(point, geom);
+        const x = Math.round(pos.x);
+        const y = Math.round(pos.y);
+        const rounded = roundedCurvePoint(point);
+        const labelText = rounded[0] + '\u00b0C / ' + rounded[1] + '%';
+        const cursorKey = mode + ':' + x + ':' + y + ':' + labelText;
+        if (dot.dataset.cursorKey !== cursorKey) {
+            dot.style.left = x + 'px';
+            dot.style.top = y + 'px';
+            dot.dataset.cursorKey = cursorKey;
+        }
+        dot.classList.toggle('is-pump', mode !== 'fan');
+        dot.classList.toggle('is-fan',  mode === 'fan');
+        dot.classList.add('is-visible');
+        if (label.dataset.cursorKey !== cursorKey) {
+            label.style.left = x + 'px';
+            label.style.top = (y - 11) + 'px';
+            label.dataset.cursorKey = cursorKey;
+        }
+        if (label.textContent !== labelText) label.textContent = labelText;
+        label.classList.toggle('is-pump', mode !== 'fan');
+        label.classList.toggle('is-fan',  mode === 'fan');
+        label.classList.add('is-visible');
+    }
+    function previewCurvePoint(point, mode, geom = getCurveGeom()) {
+        drawCurveHoverPreview(point, mode, geom);
     }
     function placeCurveTooltip(point, mode, geom = getCurveGeom(), pointCount = null) {
         const tooltip = byId('curve-tooltip');
         if (!tooltip || !geom || !point) return;
         tooltip.classList.remove('has-edit');
-        const x = geom.svgLeft - geom.plotLeft + curveMapX(point[0]) / 1000 * geom.svgWidth;
-        const y = geom.svgTop - geom.plotTop + curveMapY(point[1]) / 1000 * geom.svgHeight;
+        const pos = curveOverlayPosition(point, geom);
+        const x = pos.x;
+        const y = pos.y;
         const rounded = roundedCurvePoint(point);
         tooltip.classList.toggle('is-fan', mode === 'fan');
         tooltip.classList.toggle('is-pump', mode !== 'fan');
@@ -6892,35 +8705,61 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             plot.setAttribute('tabindex', '0');
             let pendingPointerMove = null;
             let pointerMoveRaf = 0;
+            let lastHoverFrameAt = 0;
+            let lastPreviewKey = '';
+            const hoverPreviewEnabled = true;
             function cancelPointerMoveFrame() {
                 pendingPointerMove = null;
                 if (pointerMoveRaf) cancelAnimationFrame(pointerMoveRaf);
                 pointerMoveRaf = 0;
+            }
+            function resetHoverPreviewCache() {
+                lastPreviewKey = '';
+            }
+            function setPlotCursor(value) {
+                if (plot.style.cursor !== value) plot.style.cursor = value;
             }
             function handlePointerMove(event) {
                 const geom = getCurveGeom(root);
                 if (!geom) return;
                 const mode = curveRootMode();
                 if (dragIndex === null) {
+                    const now = performance.now();
+                    if (now - lastHoverFrameAt < 32) return;
+                    lastHoverFrameAt = now;
                     if (isNearTooltip(event.clientX, event.clientY)) {
-                        plot.style.cursor = 'default';
+                        setPlotCursor('default');
+                        resetHoverPreviewCache();
                         hideCurvePreview();
                         hideCursorDot();
                         return;
                     }
                     const points = getCurvePoints(mode);
                     if (pickPoint(event, geom, points) !== null) {
-                        plot.style.cursor = 'pointer';
+                        setPlotCursor('pointer');
+                        resetHoverPreviewCache();
                         hideCurvePreview();
                         hideCursorDot();
                         return;
                     }
-                    plot.style.cursor = '';
+                    setPlotCursor('none');
+                    if (!hoverPreviewEnabled) {
+                        resetHoverPreviewCache();
+                        hideCurvePreview();
+                        hideCursorDot();
+                        return;
+                    }
                     const hPoint = pointFromEvent(event, geom);
-                    previewCurvePoint(hPoint, mode);
-                    updateCursorDot(hPoint, mode, geom);
+                    if (!hPoint) return;
+                    const previewPoint = [Math.round(hPoint[0]), Math.round(hPoint[1])];
+                    const previewKey = mode + ':' + points.length + ':' + previewPoint[0] + ':' + previewPoint[1];
+                    if (previewKey !== lastPreviewKey) {
+                        previewCurvePoint(previewPoint, mode, geom);
+                        lastPreviewKey = previewKey;
+                    }
                     return;
                 }
+                resetHoverPreviewCache();
                 const point = pointFromEvent(event, geom);
                 if (!point) return;
                 const points = getCurvePoints(mode).map(item => item.slice());
@@ -6936,6 +8775,8 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 if (event.button !== undefined && event.button !== 0) return;
                 if (event.target.closest('#curve-tooltip')) return;
                 readCurveGeom(root);
+                plot.classList.add('is-hovering');
+                resetHoverPreviewCache();
                 hideCursorDot();
                 const idx = pickPoint(event);
                 hideCurvePreview();
@@ -6976,13 +8817,17 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 cancelPointerMoveFrame();
                 dragIndex = null;
                 plot.classList.remove('is-dragging');
+                resetHoverPreviewCache();
+                try { if (!plot.matches(':hover')) plot.classList.remove('is-hovering'); } catch (exc) {}
                 try { plot.releasePointerCapture(event.pointerId); } catch (exc) {}
+                flushQueuedCurves();
+                flushQueuedLiveUpdates();
                 if (byId('curve-tooltip')?.classList.contains('is-visible')) scheduleTooltipHide();
             };
             plot.addEventListener('pointerup', stopDrag);
             plot.addEventListener('pointercancel', stopDrag);
-            plot.addEventListener('pointerenter', () => readCurveGeom(root));
-            plot.addEventListener('pointerleave', () => { cancelPointerMoveFrame(); invalidateCurveGeom(); plot.style.cursor = ''; hideCurvePreview(); hideCursorDot(); });
+            plot.addEventListener('pointerenter', () => { plot.classList.add('is-hovering'); resetHoverPreviewCache(); readCurveGeom(root); });
+            plot.addEventListener('pointerleave', () => { cancelPointerMoveFrame(); resetHoverPreviewCache(); plot.classList.remove('is-hovering'); invalidateCurveGeom(); setPlotCursor(''); hideCurvePreview(); hideCursorDot(); flushQueuedCurves(); flushQueuedLiveUpdates(); });
             plot.addEventListener('dblclick', event => {
                 if (pickPoint(event) !== null) return;
                 if (event.target.closest('#curve-tooltip')) return;
@@ -7106,6 +8951,18 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
     function themeLabelToKey(label) {
         return label === 'Графит' ? 'graphite' : label === 'Белый' ? 'light' : 'violet';
     }
+    function uiScaleValueToLabel(value) {
+        let pct = Number(String(value ?? '100').replace('%', '').replace(',', '.'));
+        if (pct > 0 && pct <= 4) pct *= 100;
+        pct = Math.round(pct || 100);
+        if (![80, 100, 125, 150, 200].includes(pct)) pct = 100;
+        return String(pct) + '%';
+    }
+    function uiScaleLabelToValue(label) {
+        let pct = Number(String(label || '100').replace('%', '').replace(',', '.'));
+        pct = Math.round(pct || 100);
+        return [80, 100, 125, 150, 200].includes(pct) ? pct : 100;
+    }
     function applyThemeClass(key) {
         document.body.classList.remove('theme-graphite', 'theme-light');
         if (key === 'graphite') document.body.classList.add('theme-graphite');
@@ -7128,7 +8985,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         const dd = dropdownBySetting(key);
         if (!dd) return;
         const label = dd.querySelector('.set-dropdown-label');
-        const text = key === 'theme' ? themeKeyToLabel(value) : String(value || 'RU');
+        const text = key === 'theme' ? themeKeyToLabel(value) : key === 'uiScale' ? uiScaleValueToLabel(value) : String(value || 'RU');
         dd.dataset.val = text;
         if (label) label.textContent = text;
         const menu = dropdownMenuFor(dd);
@@ -7141,9 +8998,9 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
     }
     function getDropdownSetting(key) {
         const dd = dropdownBySetting(key);
-        if (!dd) return key === 'theme' ? 'violet' : 'RU';
+        if (!dd) return key === 'theme' ? 'violet' : key === 'uiScale' ? 100 : 'RU';
         const value = dd.dataset.val || dd.querySelector('.set-dropdown-label')?.textContent || '';
-        return key === 'theme' ? themeLabelToKey(value) : value;
+        return key === 'theme' ? themeLabelToKey(value) : key === 'uiScale' ? uiScaleLabelToValue(value) : value;
     }
     function setToggleSetting(key, on) {
         initSettingsElements();
@@ -7164,15 +9021,72 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         el.style.setProperty('--p', pct + '%');
         const outKey = el.dataset.target;
         const out = outKey ? document.querySelector('[data-out="' + outKey + '"]') : null;
-        if (out) out.textContent = String(v);
+        if (out) out.textContent = (key === 'brightness' || key === 'oledBrightness') ? (v === 0 ? 'выкл.' : String(v) + '%') : String(v);
     }
     function getRangeSetting(key) {
         initSettingsElements();
         return Number(document.querySelector('input.set-range[data-setting="' + key + '"]')?.value || 0);
     }
+    function curvePayloadKey(state) {
+        try { return JSON.stringify(state || {}); }
+        catch (exc) { return String(Date.now()); }
+    }
+    function curveInteractionActive() {
+        const plot = byId('curve-plot');
+        return !!(plot && (plot.classList.contains('is-hovering') || plot.classList.contains('is-dragging')));
+    }
+    function queueCurvesDuringInteraction(incoming, payloadKey) {
+        if (!curveInteractionActive()) return false;
+        window.__PROEKT1_CURVES_PENDING_STATE__ = incoming || {};
+        window.__PROEKT1_CURVES_PENDING_KEY__ = payloadKey || curvePayloadKey(incoming);
+        return true;
+    }
+    function flushQueuedCurves() {
+        if (curveInteractionActive()) return;
+        const pending = window.__PROEKT1_CURVES_PENDING_STATE__;
+        const pendingKey = window.__PROEKT1_CURVES_PENDING_KEY__ || curvePayloadKey(pending);
+        window.__PROEKT1_CURVES_PENDING_STATE__ = null;
+        window.__PROEKT1_CURVES_PENDING_KEY__ = '';
+        if (!pending || pendingKey === window.__PROEKT1_CURVES_LAST_PAYLOAD__) return;
+        if (window.PROEKT1 && typeof window.PROEKT1.setCurves === 'function') {
+            window.PROEKT1.setCurves(pending);
+        }
+    }
+    function curveViewActive() {
+        return document.querySelector('.view.active')?.id === 'view-curves';
+    }
+    function curveLiveUpdateHoldActive() {
+        return curveViewActive() && curveInteractionActive();
+    }
+    function liveUpdateKey(name, args) {
+        if ((name === 'setMetric' || name === 'setFan') && args && args.length) {
+            return name + ':' + String(args[0]);
+        }
+        return name;
+    }
+    function queueLiveUpdateDuringCurveHover(name, argsLike) {
+        if (!curveLiveUpdateHoldActive()) return false;
+        const args = Array.prototype.slice.call(argsLike || []);
+        const pending = window.__PROEKT1_LIVE_PENDING_UPDATES__ || {};
+        pending[liveUpdateKey(name, args)] = { name, args };
+        window.__PROEKT1_LIVE_PENDING_UPDATES__ = pending;
+        return true;
+    }
+    function flushQueuedLiveUpdates() {
+        if (curveLiveUpdateHoldActive()) return;
+        const pending = window.__PROEKT1_LIVE_PENDING_UPDATES__;
+        if (!pending) return;
+        window.__PROEKT1_LIVE_PENDING_UPDATES__ = null;
+        Object.keys(pending).forEach(key => {
+            const item = pending[key];
+            const fn = item && window.PROEKT1 && window.PROEKT1[item.name];
+            if (typeof fn === 'function') fn.apply(window.PROEKT1, item.args || []);
+        });
+    }
 
   window.PROEKT1 = {
     setMetric(key, value, pct, color) {
+      if (queueLiveUpdateDuringCurveHover('setMetric', arguments)) return;
       const text = clean(value);
       const card = byId(key + '-card');
       const val = byId(key + '-val');
@@ -7183,6 +9097,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       if (bar) bar.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + '%';
     },
     setFan(key, rpm, alarm, message) {
+      if (queueLiveUpdateDuringCurveHover('setFan', arguments)) return;
       const card = byId(key + '-card');
       const val = byId(key + '-val');
       if (val) val.textContent = clean(rpm);
@@ -7194,6 +9109,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       }
     },
     setInfo(targets, profile, link, linkActive, loop, loopOk) {
+      if (queueLiveUpdateDuringCurveHover('setInfo', arguments)) return;
       setText('targets-lbl', targets);
       setText('profile-lbl', profile);
       setText('link-badge', link);
@@ -7206,6 +9122,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       }
     },
     setSwitch(state, softBlocked, overlay) {
+      if (queueLiveUpdateDuringCurveHover('setSwitch', arguments)) return;
       const ids = ['ts-stop', 'ts-work', 'ts-purge'];
       const st = Math.max(0, Math.min(2, Number(state) || 0));
       ids.forEach((id, idx) => { const el = byId(id); if (el) el.classList.toggle('active', idx === st); });
@@ -7218,6 +9135,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       else sw.removeAttribute('data-overlay');
     },
         setPumpHours(hoursText, pctText) {
+            if (queueLiveUpdateDuringCurveHover('setPumpHours', arguments)) return;
             setText('hours-val', hoursText || '00000.00');
             setText('hours-pct', pctText || '0%');
         },
@@ -7226,6 +9144,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             const s = state || {};
             setDropdownSetting('transport', s.transport || 'BLE');
             setDropdownSetting('theme', s.theme || 'violet');
+            setDropdownSetting('uiScale', s.uiScale ?? 100);
             setDropdownSetting('appLanguage', s.appLanguage || 'RU');
             setDropdownSetting('displayLang', s.displayLang || 'RU');
             setToggleSetting('autostart', !!s.autostart);
@@ -7234,7 +9153,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             setToggleSetting('loopProtection', !!s.loopProtection);
             setToggleSetting('keepLed', !!s.keepLed);
             setRangeSetting('brightness', s.brightness ?? 255);
-            setRangeSetting('oledBrightness', s.oledBrightness ?? 207);
+            setRangeSetting('oledBrightness', s.oledBrightness ?? 81);
             this.setPumpHours(s.hoursText, s.hoursPct);
         },
         getSettingsDraft() {
@@ -7242,6 +9161,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             return {
                 transport: getDropdownSetting('transport'),
                 theme: getDropdownSetting('theme'),
+                uiScale: getDropdownSetting('uiScale'),
                 appLanguage: getDropdownSetting('appLanguage'),
                 displayLang: getDropdownSetting('displayLang'),
                 autostart: getToggleSetting('autostart'),
@@ -7256,6 +9176,12 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         setCurves(state) {
             initCurvesElements();
             const incoming = state || {};
+            const payloadKey = curvePayloadKey(incoming);
+            const forceApply = !!window.__PROEKT1_FORCE_NEXT_CURVES_APPLY__;
+            window.__PROEKT1_FORCE_NEXT_CURVES_APPLY__ = false;
+            if (!forceApply && payloadKey === window.__PROEKT1_CURVES_LAST_PAYLOAD__) return;
+            if (!forceApply && queueCurvesDuringInteraction(incoming, payloadKey)) return;
+            window.__PROEKT1_CURVES_LAST_PAYLOAD__ = payloadKey;
             const incomingPresets = incoming.presets && typeof incoming.presets === 'object' ? incoming.presets : {};
             const presets = {};
             Object.keys(incomingPresets).forEach(name => {
@@ -7329,6 +9255,25 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 delayOffSeconds: Number(document.querySelector('[data-curve-range="delayOff"]')?.value || s.delayOffSeconds || 0)
             };
         },
+        getView() {
+            const active = document.querySelector('.view.active');
+            if (active?.id === 'view-settings') return 'settings';
+            if (active?.id === 'view-curves') return 'pump';
+            return 'dashboard';
+        },
+        showView(key) {
+            const next = key === 'settings' ? 'settings' : key === 'pump' ? 'pump' : 'dashboard';
+            const viewId = next === 'settings' ? 'view-settings' : next === 'pump' ? 'view-curves' : 'view-dashboard';
+            const navId = next === 'settings' ? 'nav-settings' : next === 'pump' ? 'nav-pump' : 'nav-dashboard';
+            const view = byId(viewId);
+            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            byId(navId)?.classList.add('active');
+            view?.classList.add('active');
+            setText('page-title', view?.dataset.title || '');
+            setText('page-subtitle', view?.dataset.sub || '');
+            flushQueuedLiveUpdates();
+        },
         showCurves() {
             document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
@@ -7344,12 +9289,74 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       byId('view-dashboard')?.classList.add('active');
       setText('page-title', 'ПАНЕЛЬ УПРАВЛЕНИЯ');
       setText('page-subtitle', '· онлайн');
+      flushQueuedLiveUpdates();
     }
   };
 
   function bindBridge(bridge) {
     if (!bridge || window.__PROEKT1_BRIDGE_BOUND__) return;
     window.__PROEKT1_BRIDGE_BOUND__ = true;
+        const __uiDbgRect = r => r ? ({x:r.x,y:r.y,w:r.width,h:r.height,r:r.right,b:r.bottom}) : null;
+        const __uiDbgCss = el => {
+            if (!el) return null;
+            const cs = getComputedStyle(el);
+            return {
+                display:cs.display, visibility:cs.visibility, opacity:cs.opacity, position:cs.position,
+                left:cs.left, top:cs.top, width:cs.width, height:cs.height,
+                transform:cs.transform, transformOrigin:cs.transformOrigin,
+                background:cs.backgroundColor, clipPath:cs.clipPath, borderRadius:cs.borderRadius,
+                overflow:cs.overflow, zIndex:cs.zIndex
+            };
+        };
+        const __uiDbgSnapshot = (reason, extra) => {
+            const win = byId('app-window');
+            const body = document.body;
+            const root = document.documentElement;
+            const rcs = getComputedStyle(root);
+            return {
+                reason, extra: extra || null, ts: performance.now(),
+                readyState: document.readyState, visibilityState: document.visibilityState,
+                hasFocus: document.hasFocus(),
+                viewport: {
+                    innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+                    outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+                    dpr: window.devicePixelRatio,
+                    visualViewport: window.visualViewport ? {w:window.visualViewport.width,h:window.visualViewport.height,scale:window.visualViewport.scale,offsetLeft:window.visualViewport.offsetLeft,offsetTop:window.visualViewport.offsetTop} : null,
+                    screen: {w:screen.width,h:screen.height,availW:screen.availWidth,availH:screen.availHeight}
+                },
+                root: {
+                    clientWidth: root.clientWidth, clientHeight: root.clientHeight,
+                    scrollWidth: root.scrollWidth, scrollHeight: root.scrollHeight,
+                    cssFit: rcs.getPropertyValue('--proekt1-dpi-fit').trim(),
+                    cssFitW: rcs.getPropertyValue('--proekt1-dpi-fit-w').trim(),
+                    cssFitH: rcs.getPropertyValue('--proekt1-dpi-fit-h').trim()
+                },
+                body: body ? {className:body.className, rect:__uiDbgRect(body.getBoundingClientRect()), offsetWidth:body.offsetWidth, offsetHeight:body.offsetHeight, scrollWidth:body.scrollWidth, scrollHeight:body.scrollHeight, inline:{background:body.style.background, zoom:body.style.zoom, transform:body.style.transform}, computed:__uiDbgCss(body)} : null,
+                appWindow: win ? {rect:__uiDbgRect(win.getBoundingClientRect()), offsetWidth:win.offsetWidth, offsetHeight:win.offsetHeight, clientWidth:win.clientWidth, clientHeight:win.clientHeight, scrollWidth:win.scrollWidth, scrollHeight:win.scrollHeight, inline:{left:win.style.left, top:win.style.top, width:win.style.width, height:win.style.height, transform:win.style.transform, opacity:win.style.opacity, display:win.style.display, visibility:win.style.visibility}, computed:__uiDbgCss(win)} : null
+            };
+        };
+        window.__PROEKT1_DEBUG_SNAPSHOT__ = __uiDbgSnapshot;
+        const __uiDbg = (tag, extra) => {
+            try { bridge.debugLog(String(tag || 'event'), JSON.stringify(__uiDbgSnapshot(tag, extra || null))); } catch(e) {}
+        };
+        if (__proekt1DeepDebug && !window.__PROEKT1_DEBUG_EVENTS_BOUND__) {
+            window.__PROEKT1_DEBUG_EVENTS_BOUND__ = true;
+            window.addEventListener('resize', () => __uiDbg('window.resize'), true);
+            window.addEventListener('focus', () => __uiDbg('window.focus'), true);
+            window.addEventListener('blur', () => __uiDbg('window.blur'), true);
+            document.addEventListener('visibilitychange', () => __uiDbg('document.visibilitychange'), true);
+            window.addEventListener('error', event => __uiDbg('window.error', {message:event.message, filename:event.filename, lineno:event.lineno, colno:event.colno}), true);
+            window.addEventListener('unhandledrejection', event => __uiDbg('window.unhandledrejection', {reason:String(event.reason)}), true);
+            try {
+                const root = document.documentElement;
+                const body = document.body;
+                const win = byId('app-window');
+                if (root) new MutationObserver(muts => __uiDbg('mutation.root', {attrs:muts.map(m => m.attributeName)})).observe(root, {attributes:true, attributeFilter:['style','class']});
+                if (body) new MutationObserver(muts => __uiDbg('mutation.body', {attrs:muts.map(m => m.attributeName)})).observe(body, {attributes:true, attributeFilter:['style','class']});
+                if (win) new MutationObserver(muts => __uiDbg('mutation.appWindow', {attrs:muts.map(m => m.attributeName)})).observe(win, {attributes:true, attributeFilter:['style','class']});
+            } catch(e) {}
+        }
+        if (__proekt1DeepDebug) __uiDbg('bridge.bound');
         initSettingsElements();
         initCurvesElements();
     [['ts-stop', 0], ['ts-work', 1], ['ts-purge', 2]].forEach(([id, state]) => {
@@ -7360,15 +9367,76 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
       const el = byId(id);
       if (el) el.addEventListener('click', () => bridge.navClicked(key));
     });
-    byId('btn-win-min')?.addEventListener('click', event => { event.stopPropagation(); bridge.windowAction('minimize'); }, true);
-    byId('btn-win-close')?.addEventListener('click', event => { event.stopPropagation(); bridge.windowAction('close'); }, true);
+    byId('btn-win-max')?.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+      bridge.windowAction('fullscreen');
+    }, true);
+    byId('btn-win-min')?.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); bridge.windowAction('minimize'); }, true);
+    byId('btn-win-close')?.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); bridge.windowAction('close'); }, true);
+        if (!document.__proekt1FullscreenEscapeBound) {
+            document.__proekt1FullscreenEscapeBound = true;
+            document.addEventListener('keydown', event => {
+                if (event.key !== 'Escape') return;
+                if (!document.body.classList.contains('fullscreen')) return;
+                event.preventDefault();
+                event.stopPropagation();
+                bridge.windowAction('fullscreen-exit');
+            }, true);
+        }
+        const header = byId('header');
+        if (header && !header.__proekt1NativeDragBound) {
+            header.__proekt1NativeDragBound = true;
+            header.addEventListener('mousedown', event => {
+                if (event.button !== 0) return;
+                if (event.target && event.target.closest && event.target.closest('.win-btn')) return;
+                if (document.body.classList.contains('fullscreen')) return;
+                event.preventDefault();
+                // stopImmediatePropagation also blocks the HTML preview's initDrag
+                // listener which is bound on the same #header element (target phase
+                // listeners on the same element fire regardless of capture/bubble
+                // flag — only stopImmediatePropagation suppresses sibling listeners).
+                // Without this the preview drag handler sets dragging=true on mousedown
+                // and then rewrites .app-window inline left/top on every mousemove
+                // while the OS-level window drag is also running, visibly shifting
+                // the HTML content inside the Qt frame.
+                event.stopImmediatePropagation();
+                event.stopPropagation();
+                bridge.windowAction('drag');
+            }, true);
+        }
+        // Defensive: even with stopImmediatePropagation above, if the inline drag
+        // handler somehow ran (e.g. during a brief window before runtime JS bound),
+        // .app-window may have stale inline left/top set in px. A MutationObserver
+        // wipes them so the runtime CSS `left:0 !important; top:0 !important` wins
+        // unconditionally. Cheap because it only fires on style attribute changes.
+        const _pwin = byId('app-window');
+        if (_pwin && !_pwin.__proekt1StyleGuardBound) {
+            _pwin.__proekt1StyleGuardBound = true;
+            // Immediate wipe: if HTML preview's initDrag fired before runtime JS bound
+            // and left stale inline left/top on the element, clear them now. Observer
+            // only catches FUTURE mutations, not the existing attribute value.
+            const _wipe = () => {
+                const s = _pwin.style;
+                if (s.left && s.left !== '0px' && s.left !== '0') s.left = '';
+                if (s.top && s.top !== '0px' && s.top !== '0') s.top = '';
+            };
+            _wipe();
+            const _guard = new MutationObserver(_wipe);
+            _guard.observe(_pwin, { attributes: true, attributeFilter: ['style'] });
+        }
         byId('btn-log')?.addEventListener('click', event => { event.stopPropagation(); bridge.settingsAction('log'); });
         byId('btn-settings-cancel')?.addEventListener('click', event => { event.stopPropagation(); bridge.settingsAction('cancel'); });
         byId('btn-settings-save')?.addEventListener('click', event => {
             event.stopPropagation();
             bridge.applySettings(JSON.stringify(window.PROEKT1.getSettingsDraft()));
         });
-        byId('btn-curves-cancel')?.addEventListener('click', event => { event.stopPropagation(); bridge.curvesAction('cancel'); });
+        byId('btn-curves-cancel')?.addEventListener('click', event => {
+            event.stopPropagation();
+            window.__PROEKT1_FORCE_NEXT_CURVES_APPLY__ = true;
+            bridge.curvesAction('cancel');
+        });
         byId('btn-curves-save')?.addEventListener('click', event => {
             event.stopPropagation();
             bridge.applyCurves(JSON.stringify(window.PROEKT1.getCurvesDraft()));
@@ -7408,6 +9476,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
   }
 })();
 """
+        runtime_js = runtime_js.replace("__PROEKT1_DEEP_DEBUG__", "true" if bool(getattr(self, '_ui_debug_deep', False)) else "false")
         self.web_view.page().runJavaScript(runtime_js)
         # Apply the current theme's fullscreen backdrop colour immediately.
         # Use a JS callback on the LAST runJavaScript call so we know the renderer
@@ -7418,6 +9487,32 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         try:
             _th = THEMES.get(current_theme_name(), THEMES['violet'])
             _fs_bg = _th.get('fullscreen_bg', '#08091a')
+            _window_bg = self._web_surface_backing_color()
+            self._set_web_view_opaque_input_surface("web.loadFinished")
+            self._apply_web_view_backing()
+            _dpi_fit = max(0.25, min(1.0, float(getattr(self, '_dpi_fit_factor', 1.0))))
+            _ui_scale = max(0.8, min(2.0, float(self._interface_scale_factor())))
+            _engine_zoom = self._web_engine_zoom_for_scale(_dpi_fit)
+            _prev_engine_zoom = float(getattr(self, '_web_engine_zoom_factor', 1.0) or 1.0)
+            self._web_engine_zoom_factor = _engine_zoom
+            if abs(_prev_engine_zoom - _engine_zoom) > 1e-4:
+                try:
+                    self.web_view.setZoomFactor(_engine_zoom)
+                except Exception:
+                    pass
+            _engine_absorbs_ui = (
+                (_ui_scale >= 0.999 and abs(float(_engine_zoom) - float(_ui_scale)) <= 1e-3)
+                or (_ui_scale < 0.999 and _engine_zoom < 0.999)
+            )
+            if _engine_absorbs_ui:
+                _css_zoom = 1.0
+                _css_fit = _dpi_fit
+            else:
+                _css_zoom = _ui_scale if _ui_scale >= 1.0 else 1.0
+                _css_fit = _dpi_fit if _ui_scale >= 1.0 else max(0.25, min(1.0, _dpi_fit * _ui_scale))
+            _effective_scale = max(0.25, min(4.0, _css_fit * _css_zoom))
+            _fit_w = f"{float(getattr(self, '_design_window_w', 1100)):.6f}px"
+            _fit_h = f"{float(getattr(self, '_design_window_h', 760)):.6f}px"
             def _on_page_ready(_result=None):
                 # Primary path: bridge.notifyWebUiReady() fires from bindBridge
                 # when QWebChannel connects (~1 s after loadFinished) — by that
@@ -7426,9 +9521,24 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 # This timer is a safety fallback in case QWebChannel never connects
                 # (e.g. qwebchannel.js fails to load).  The __init__ 20 s timer
                 # is the last resort.
-                QTimer.singleShot(8000, self._finish_startup_overlay)
+                if getattr(self, '_web_recreate_in_progress', False):
+                    QTimer.singleShot(250, self._finish_startup_overlay)
+                else:
+                    QTimer.singleShot(8000, self._finish_startup_overlay)
+            _dpi_class_js = (
+                "document.body.classList.add('dpi-fit-active');"
+                if _css_fit < 0.999
+                else "document.body.classList.remove('dpi-fit-active');"
+            )
             self.web_view.page().runJavaScript(
-                f"document.documentElement.style.setProperty('--proekt1-fs-bg', {repr(_fs_bg)}); true;",
+                _dpi_class_js
+                + f"document.documentElement.style.setProperty('--proekt1-fs-bg', {repr(_fs_bg)});"
+                + f"document.documentElement.style.setProperty('--proekt1-window-bg', {json.dumps(_window_bg)});"
+                + f"document.documentElement.style.setProperty('--proekt1-ui-scale', {json.dumps(f'{_css_zoom:.6f}')});"
+                + f"document.documentElement.style.setProperty('--proekt1-dpi-fit', {json.dumps(f'{_css_fit:.6f}')});"
+                + f"document.documentElement.style.setProperty('--proekt1-dpi-fit-w', {json.dumps(_fit_w)});"
+                + f"document.documentElement.style.setProperty('--proekt1-dpi-fit-h', {json.dumps(_fit_h)});"
+                + "window.dispatchEvent(new Event('resize')); true;",
                 _on_page_ready
             )
         except Exception:
@@ -7440,7 +9550,18 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         # put it on top of the overlay and cause a flash of unstyled/transparent
         # Chromium surface before the overlay has had a chance to fade.
         self._reset_web_view_clip()
-        self._refresh_web_view_surface()
+        if self._web_surface_needs_native_pin():
+            try:
+                cw = self.centralWidget()
+                if cw is not None:
+                    self._set_web_view_geometry_stable(cw.rect(), "web.loadFinished.ready", sync_fit=True, reset_clip=True, raise_view=False)
+                self._pin_web_view_native_chain("web.loadFinished.ready")
+                self.web_view.update()
+                self.update()
+            except Exception:
+                pass
+        else:
+            self._refresh_web_view_surface()
         self._apply_rounded_mask()
         QTimer.singleShot(100, self._sync_web_snapshot)
 
@@ -7455,23 +9576,66 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             if theme_name is None:
                 theme_name = current_theme_name()
             palette = THEMES.get(theme_name, THEMES['violet'])
+            self._apply_web_view_backing()
             fs_bg = palette.get('fullscreen_bg', '#08091a')
+            window_bg = self._web_surface_backing_color()
             web_view.page().runJavaScript(
                 f"document.documentElement.style.setProperty('--proekt1-fs-bg', {repr(fs_bg)});"
+                f"document.documentElement.style.setProperty('--proekt1-window-bg', {json.dumps(window_bg)});"
             )
         except Exception:
             pass
 
     def _finish_startup_overlay(self):
+        self._ui_debug_state("startup_overlay.finish.enter", include_dom=True)
+        self._ui_debug_native_visual_probe("startup_overlay.finish.enter", include_tree=True)
         overlay = getattr(self, '_lifecycle_overlay', None)
         web_view = getattr(self, 'web_view', None)
+        if getattr(self, '_web_recreate_in_progress', False) and web_view is not None:
+            try:
+                reason = str(getattr(self, '_web_recreate_reason', ''))
+                self._ui_debug_log("web.recreate.finish_show", reason=reason)
+                cw = self.centralWidget()
+                if cw is not None:
+                    self._set_web_view_geometry_stable(
+                        cw.rect(),
+                        "web.recreate.finish_show.before_show",
+                        sync_fit=False,
+                        reset_clip=True,
+                        raise_view=False,
+                    )
+                self._set_web_view_opaque_input_surface("web.recreate.finish_show")
+                self._apply_web_view_backing()
+                if not web_view.isVisible():
+                    web_view.show()
+                web_view.raise_()
+                self._pin_web_view_native_chain("web.recreate.finish_show")
+                self._sync_actual_web_fit_factor()
+                self._reset_web_view_clip()
+                self._apply_rounded_mask()
+                self._web_ready = True
+                self._web_recreate_in_progress = False
+                self._sync_web_snapshot()
+                self._ui_debug_state("web.recreate.finish_show.after", include_dom=True)
+                self._ui_debug_native_visual_probe("web.recreate.finish_show.after", include_tree=True)
+                QTimer.singleShot(40, lambda: self._pin_web_view_native_chain("web.recreate.pin_40ms"))
+                QTimer.singleShot(140, lambda: self._pin_web_view_native_chain("web.recreate.pin_140ms"))
+                QTimer.singleShot(320, lambda: self._pin_web_view_native_chain("web.recreate.pin_320ms"))
+                QTimer.singleShot(220, lambda: self._verify_web_view_native_surface("web.recreate.after_220ms"))
+                QTimer.singleShot(520, lambda: self._ui_debug_native_visual_probe("web.recreate.after_520ms", include_tree=True))
+            except Exception as exc:
+                self._web_recreate_in_progress = False
+                self._ui_debug_log("web.recreate.finish_show.error", error=str(exc))
+            return
         if overlay is None or web_view is None:
             if web_view is not None and not web_view.isVisible():
                 web_view.show()
+                self._ui_debug_state("startup_overlay.no_overlay.show_web", include_dom=True)
             return
         # Idempotency guard — notifyWebUiReady and the 8000 ms fallback timer
         # both call this method; only the first call should start the transition.
         if getattr(self, '_startup_transition_started', False):
+            self._ui_debug_log("startup_overlay.finish.skip", reason="already_started")
             return
         self._startup_transition_started = True
         try:
@@ -7486,10 +9650,19 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             # Instead: reveal web_view first → overlay instantly goes behind the
             # Chromium HWND → then fade overlay silently (user can't see it).
             delay_ms = max(500, 1800 - elapsed_ms)
+            self._ui_debug_log("startup_overlay.finish.schedule_reveal", elapsedMs=elapsed_ms, delayMs=delay_ms)
 
             def _reveal():
+                self._ui_debug_state("startup_overlay.reveal.before", include_dom=True)
+                self._ui_debug_native_visual_probe("startup_overlay.reveal.before", include_tree=True)
                 if not web_view.isVisible():
                     web_view.show()
+                try:
+                    self._apply_dpi_window_metrics(QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen())
+                    self._reset_web_view_clip()
+                    self._refresh_web_view_surface(opacity_nudge=False)
+                except Exception:
+                    pass
                 # Overlay is now hidden behind the Chromium HWND — user can't see it.
                 # Fade out to clean up widget state (stop spinner timer, hide widget).
                 try:
@@ -7497,6 +9670,8 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                         overlay.fade_out(360)
                 except Exception:
                     pass
+                self._ui_debug_state("startup_overlay.reveal.after", include_dom=True)
+                self._ui_debug_native_visual_probe("startup_overlay.reveal.after", include_tree=True)
 
             QTimer.singleShot(delay_ms, _reveal)
         except Exception:
@@ -7525,10 +9700,46 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
-    def _web_js_call(self, name: str, *args):
+    def _web_live_call_key(self, name: str, args: tuple) -> str:
+        if name in ("setMetric", "setFan") and args:
+            return f"{name}:{args[0]}"
+        return name
+
+    def _should_defer_web_live_call(self, name: str) -> bool:
+        if name not in {"setMetric", "setFan", "setInfo", "setSwitch", "setPumpHours"}:
+            return False
+        return str(getattr(self, '_web_active_view', 'dashboard') or 'dashboard') == "pump"
+
+    def _queue_deferred_web_live_call(self, name: str, args: tuple):
+        try:
+            pending = getattr(self, '_web_deferred_live_calls', None)
+            if pending is None:
+                pending = {}
+                self._web_deferred_live_calls = pending
+            pending[self._web_live_call_key(name, args)] = (name, args)
+        except Exception:
+            pass
+
+    def _flush_deferred_web_live_calls(self):
+        try:
+            if str(getattr(self, '_web_active_view', 'dashboard') or 'dashboard') == "pump":
+                return
+            pending = getattr(self, '_web_deferred_live_calls', None)
+            if not pending:
+                return
+            self._web_deferred_live_calls = {}
+            for name, args in list(pending.values()):
+                self._web_js_call(name, *args, force=True)
+        except Exception:
+            pass
+
+    def _web_js_call(self, name: str, *args, force: bool = False):
         if not getattr(self, '_web_ready', False):
             return
         try:
+            if not force and self._should_defer_web_live_call(name):
+                self._queue_deferred_web_live_call(name, args)
+                return
             args_js = ", ".join(json.dumps(arg, ensure_ascii=False) for arg in args)
             self.web_view.page().runJavaScript(f"window.PROEKT1 && window.PROEKT1.{name}({args_js});")
         except Exception:
@@ -7582,9 +9793,10 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             "purgeOnShutdown": bool(getattr(self, 'purge_on_shutdown_enabled', False)),
             "loopProtection": bool(getattr(self, 'loop_protection_enabled', False)),
             "keepLed": bool(getattr(self, 'keep_led_on_disconnected', False)),
-            "brightness": int(max(0, min(255, int(getattr(self, 'brightness', 255) or 0)))),
-            "oledBrightness": int(max(0, min(255, int(getattr(self, 'oled_brightness', 207) or 0)))),
+            "brightness": self._brightness_byte_to_settings_percent(getattr(self, 'brightness', 255)),
+            "oledBrightness": self._brightness_byte_to_settings_percent(getattr(self, 'oled_brightness', 207)),
             "theme": getattr(self, 'theme', 'violet') if getattr(self, 'theme', 'violet') in THEMES else 'violet',
+            "uiScale": int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
             "appLanguage": getattr(self, 'app_language', 'RU') if getattr(self, 'app_language', 'RU') in ("RU", "ENG") else "RU",
             "displayLang": getattr(self, 'display_lang', 'RU') if getattr(self, 'display_lang', 'RU') in ("RU", "ENG") else "RU",
             "hoursText": hours_text,
@@ -7593,6 +9805,17 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
 
     def _sync_web_settings(self):
         self._web_js_call("setSettings", self._web_settings_snapshot())
+
+    def _sync_web_active_view(self):
+        try:
+            view = str(getattr(self, '_web_active_view', 'dashboard') or 'dashboard')
+            if view not in ("dashboard", "pump", "settings"):
+                view = "dashboard"
+            self._web_js_call("showView", view)
+            if view != "pump":
+                self._flush_deferred_web_live_calls()
+        except Exception:
+            pass
 
     def _curve_points_for_web(self, points: Any) -> list[list[float]]:
         cleaned: list[list[float]] = []
@@ -7717,6 +9940,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
 
     def _apply_web_curves_json(self, payload_json: str):
         global _last_preset_name
+        self._web_active_view = "pump"
         try:
             data = json.loads(payload_json or "{}")
         except Exception:
@@ -7804,17 +10028,24 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             except Exception:
                 pass
 
-    def _sanitize_web_brightness(self, value: Any) -> int:
+    def _brightness_byte_to_settings_percent(self, value: Any) -> int:
         try:
             v = int(value)
         except Exception:
             v = 255
         v = max(0, min(255, v))
-        if v != 0 and v < LED_MIN_BRIGHT:
-            v = LED_MIN_BRIGHT
-        return v
+        return int(round(v * 100 / 255))
+
+    def _settings_percent_to_brightness_byte(self, value: Any) -> int:
+        try:
+            v = int(value)
+        except Exception:
+            v = 100
+        v = max(0, min(100, v))
+        return int(round(v * 255 / 100))
 
     def _apply_web_settings_json(self, payload_json: str):
+        self._web_active_view = "settings"
         try:
             data = json.loads(payload_json or "{}")
         except Exception:
@@ -7848,17 +10079,15 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self.send_loopprot_flag()
 
         old_brightness = int(getattr(self, 'brightness', 255) or 0)
-        new_brightness = self._sanitize_web_brightness(data.get("brightness", old_brightness))
+        old_brightness_percent = self._brightness_byte_to_settings_percent(old_brightness)
+        new_brightness = self._settings_percent_to_brightness_byte(data.get("brightness", old_brightness_percent))
         self.brightness = new_brightness
         if new_brightness != old_brightness:
             self.send_led_brightness_only(new_brightness)
 
         old_oled = int(getattr(self, 'oled_brightness', 207) or 0)
-        try:
-            new_oled = int(data.get("oledBrightness", old_oled))
-        except Exception:
-            new_oled = old_oled
-        new_oled = max(0, min(255, new_oled))
+        old_oled_percent = self._brightness_byte_to_settings_percent(old_oled)
+        new_oled = self._settings_percent_to_brightness_byte(data.get("oledBrightness", old_oled_percent))
         self.oled_brightness = new_oled
         if new_oled != old_oled:
             self.send_oled_brightness(new_oled)
@@ -7875,6 +10104,10 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         new_app_lang = str(data.get("appLanguage", getattr(self, 'app_language', 'RU'))).upper()
         self.app_language = new_app_lang if new_app_lang in ("RU", "ENG") else "RU"
 
+        old_scale = int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100))
+        new_scale = self._sanitize_interface_scale_percent(data.get("uiScale", old_scale), old_scale)
+        self.interface_scale_percent = new_scale
+
         new_theme = str(data.get("theme", getattr(self, 'theme', 'violet')))
         if new_theme not in THEMES:
             new_theme = "violet"
@@ -7885,17 +10118,29 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             except Exception:
                 pass
             try:
+                self._rounded_frame.setTheme(new_theme)
+            except Exception:
+                pass
+            try:
                 self._lifecycle_overlay.setTheme(new_theme)
             except Exception:
                 pass
+            self._set_main_window_opaque_hit_surface("web_settings.theme")
             self._update_web_fullscreen_theme(new_theme)
         else:
             self.theme = new_theme
 
+        if new_scale != old_scale:
+            self._apply_interface_scale(resize_window=True, previous_percent=old_scale)
+        else:
+            self._sync_actual_web_fit_factor()
+
         self.save_app_config()
         self._sync_web_settings()
+        self._sync_web_active_view()
 
     def _on_web_settings_action(self, action: str):
+        self._web_active_view = "settings"
         if action == "cancel":
             self._sync_web_settings()
         elif action == "log":
@@ -8025,6 +10270,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         self._sync_web_triswitch()
         self._sync_web_settings()
         self._sync_web_curves()
+        self._sync_web_active_view()
 
     def _on_web_switch_state(self, state: int):
         state = max(0, min(2, int(state)))
@@ -8040,19 +10286,28 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             pass
 
     def _on_web_nav_clicked(self, key: str):
+        key = str(key or "")
         if key == "pump":
+            self._web_active_view = "pump"
             self._sync_web_curves()
         elif key == "led":
+            self._web_active_view = "dashboard"
             try:
                 self._sidebar_placeholder("Подсветка")
             finally:
                 self._web_js_call("showDashboard")
+                self._flush_deferred_web_live_calls()
         elif key == "settings":
+            self._web_active_view = "settings"
             # HTML-макет сам переключает nav-settings -> view-settings.
             # Старый SettingsDialog больше не открываем поверх WebEngine UI.
-            pass
+            self._flush_deferred_web_live_calls()
+        else:
+            self._web_active_view = "dashboard"
+            self._flush_deferred_web_live_calls()
 
     def _on_web_curves_action(self, action: str):
+        self._web_active_view = "pump"
         if action == "cancel":
             self._sync_web_curves()
         elif action == "editor":
@@ -8060,11 +10315,750 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             self._sync_web_curves()
             self._web_js_call("showCurves")
 
+    def _ui_debug_json(self, value) -> str:
+        try:
+            if isinstance(value, str):
+                return value if len(value) <= 5000 else value[:5000] + "...(truncated)"
+            return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return "<unprintable>"
+
+    def _ui_debug_log(self, event: str, **fields):
+        if not bool(getattr(self, '_ui_debug_enabled', False)):
+            return
+        try:
+            self._ui_debug_seq = int(getattr(self, '_ui_debug_seq', 0)) + 1
+            elapsed = time.monotonic() - float(getattr(self, '_ui_debug_t0', time.monotonic()))
+            parts = []
+            for key, value in fields.items():
+                parts.append(f"{key}={self._ui_debug_json(value)}")
+            suffix = (" " + " ".join(parts)) if parts else ""
+            print(f"[UIDBG {self._ui_debug_seq:05d} +{elapsed:08.3f}s] {event}{suffix}", flush=True)
+        except Exception:
+            pass
+
+    def _ui_debug_rect(self, rect) -> dict:
+        try:
+            return {
+                "x": int(rect.x()), "y": int(rect.y()),
+                "w": int(rect.width()), "h": int(rect.height()),
+                "r": int(rect.right()), "b": int(rect.bottom()),
+            }
+        except Exception:
+            return {}
+
+    def _ui_debug_point(self, point) -> dict:
+        try:
+            return {"x": int(point.x()), "y": int(point.y())}
+        except Exception:
+            return {}
+
+    def _ui_debug_screen(self, screen) -> dict:
+        if screen is None:
+            return {"none": True}
+        data = {}
+        for name, getter in (
+            ("name", lambda: screen.name()),
+            ("manufacturer", lambda: screen.manufacturer()),
+            ("model", lambda: screen.model()),
+            ("serial", lambda: screen.serialNumber()),
+            ("dpr", lambda: float(screen.devicePixelRatio())),
+            ("logicalDpi", lambda: float(screen.logicalDotsPerInch())),
+            ("physicalDpi", lambda: float(screen.physicalDotsPerInch())),
+        ):
+            try:
+                data[name] = getter()
+            except Exception:
+                pass
+        try:
+            data["geom"] = self._ui_debug_rect(screen.geometry())
+            data["avail"] = self._ui_debug_rect(screen.availableGeometry())
+        except Exception:
+            pass
+        return data
+
+    def _ui_debug_hwnd(self, hwnd_int: int) -> dict:
+        info = {"hwnd": hex(int(hwnd_int or 0))}
+        if os.name != 'nt' or not hwnd_int:
+            return info
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = wintypes.HWND(hwnd_int)
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+            user32.IsWindowEnabled.restype = wintypes.BOOL
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            info["isWindow"] = bool(user32.IsWindow(hwnd))
+            info["visible"] = bool(user32.IsWindowVisible(hwnd))
+            info["enabled"] = bool(user32.IsWindowEnabled(hwnd))
+            parent = int(user32.GetParent(hwnd) or 0)
+            root = int(user32.GetAncestor(hwnd, 2) or 0)  # GA_ROOT
+            if parent:
+                info["parent"] = hex(parent)
+            if root:
+                info["root"] = hex(root)
+        except Exception as exc:
+            info["basicError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetClassNameW.restype = ctypes.c_int
+            length = int(user32.GetClassNameW(wintypes.HWND(hwnd_int), buf, len(buf)))
+            if length > 0:
+                info["className"] = buf.value
+        except Exception as exc:
+            info["classError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            try:
+                get_long_ptr = user32.GetWindowLongPtrW
+            except AttributeError:
+                get_long_ptr = user32.GetWindowLongW
+            get_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long_ptr.restype = ctypes.c_ssize_t
+            style = int(get_long_ptr(wintypes.HWND(hwnd_int), -16))
+            ex_style = int(get_long_ptr(wintypes.HWND(hwnd_int), -20))
+            info["style"] = hex(style & 0xFFFFFFFFFFFFFFFF)
+            info["exStyle"] = hex(ex_style & 0xFFFFFFFFFFFFFFFF)
+        except Exception as exc:
+            info["styleError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            pt = wintypes.POINT(0, 0)
+            user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+            user32.ClientToScreen.restype = wintypes.BOOL
+            if user32.ClientToScreen(wintypes.HWND(hwnd_int), ctypes.byref(pt)):
+                info["clientToScreen0"] = {"x": int(pt.x), "y": int(pt.y)}
+        except Exception as exc:
+            info["clientToScreenError"] = str(exc)
+        try:
+            dwmapi = ctypes.windll.dwmapi
+            DWMWA_CLOAKED = 14
+            cloaked = ctypes.c_int(0)
+            hr = int(dwmapi.DwmGetWindowAttribute(wintypes.HWND(hwnd_int), ctypes.c_int(DWMWA_CLOAKED), ctypes.byref(cloaked), ctypes.sizeof(cloaked)))
+            info["dwmCloaked"] = {"hr": hr, "value": int(cloaked.value)}
+        except Exception as exc:
+            info["dwmCloakedError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            rect = wintypes.RECT()
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetWindowRect.restype = wintypes.BOOL
+            if user32.GetWindowRect(wintypes.HWND(hwnd_int), ctypes.byref(rect)):
+                info["windowRect"] = {
+                    "x": int(rect.left), "y": int(rect.top),
+                    "w": int(rect.right - rect.left), "h": int(rect.bottom - rect.top),
+                    "r": int(rect.right), "b": int(rect.bottom),
+                }
+        except Exception as exc:
+            info["windowRectError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            rect = wintypes.RECT()
+            user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetClientRect.restype = wintypes.BOOL
+            if user32.GetClientRect(wintypes.HWND(hwnd_int), ctypes.byref(rect)):
+                info["clientRect"] = {
+                    "x": int(rect.left), "y": int(rect.top),
+                    "w": int(rect.right - rect.left), "h": int(rect.bottom - rect.top),
+                    "r": int(rect.right), "b": int(rect.bottom),
+                }
+        except Exception as exc:
+            info["clientRectError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+            user32.GetDpiForWindow.restype = wintypes.UINT
+            info["dpi"] = int(user32.GetDpiForWindow(wintypes.HWND(hwnd_int)))
+        except Exception as exc:
+            info["dpiError"] = str(exc)
+        try:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            gdi32.CreateRectRgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            gdi32.CreateRectRgn.restype = ctypes.c_void_p
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteObject.restype = wintypes.BOOL
+            user32.GetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p]
+            user32.GetWindowRgn.restype = ctypes.c_int
+            rgn = gdi32.CreateRectRgn(0, 0, 0, 0)
+            if rgn:
+                code = int(user32.GetWindowRgn(wintypes.HWND(hwnd_int), rgn))
+                info["windowRgn"] = {"code": code, "name": {0: "ERROR_OR_NONE", 1: "NULLREGION", 2: "SIMPLEREGION", 3: "COMPLEXREGION"}.get(code, "UNKNOWN")}
+                gdi32.DeleteObject(rgn)
+        except Exception as exc:
+            info["rgnError"] = str(exc)
+        return info
+
+    def _ui_debug_hwnd_tree(self, hwnd_int: int, max_children: int = 32) -> dict:
+        data = {"root": self._ui_debug_hwnd(hwnd_int), "children": []}
+        if os.name != 'nt' or not hwnd_int:
+            return data
+        try:
+            user32 = ctypes.windll.user32
+            max_children = max(0, min(80, int(max_children)))
+            children = []
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def _enum_child(child_hwnd, _lparam):
+                if len(children) >= max_children:
+                    return False
+                children.append(self._ui_debug_hwnd(int(child_hwnd)))
+                return True
+
+            callback = WNDENUMPROC(_enum_child)
+            user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+            user32.EnumChildWindows.restype = wintypes.BOOL
+            user32.EnumChildWindows(wintypes.HWND(hwnd_int), callback, 0)
+            data["children"] = children
+            data["childCountLogged"] = len(children)
+        except Exception as exc:
+            data["error"] = str(exc)
+        return data
+
+    def _ui_debug_widget_pixels(self, name: str, widget) -> dict:
+        info = {"name": str(name)}
+        try:
+            if widget is None:
+                info["missing"] = True
+                return info
+            global_pos = widget.mapToGlobal(QPoint(0, 0))
+            width = max(1, int(widget.width()))
+            height = max(1, int(widget.height()))
+            center = QPoint(int(global_pos.x() + width // 2), int(global_pos.y() + height // 2))
+            screen = QApplication.screenAt(center) or QApplication.primaryScreen()
+            info.update({
+                "widgetVisible": bool(widget.isVisible()),
+                "widgetHidden": bool(widget.isHidden()),
+                "global": {"x": int(global_pos.x()), "y": int(global_pos.y()), "w": width, "h": height},
+                "screen": self._ui_debug_screen(screen),
+            })
+            if screen is None:
+                info["grabError"] = "no_screen"
+                return info
+            pixmap = screen.grabWindow(0, int(global_pos.x()), int(global_pos.y()), width, height)
+            info["pixmap"] = {"isNull": bool(pixmap.isNull()), "w": int(pixmap.width()), "h": int(pixmap.height()), "dpr": float(pixmap.devicePixelRatio())}
+            if pixmap.isNull() or pixmap.width() <= 0 or pixmap.height() <= 0:
+                return info
+            image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32)
+            img_w = int(image.width())
+            img_h = int(image.height())
+            sample_points = {
+                "tl": (0.08, 0.08), "tc": (0.50, 0.08), "tr": (0.92, 0.08),
+                "ml": (0.08, 0.50), "cc": (0.50, 0.50), "mr": (0.92, 0.50),
+                "bl": (0.08, 0.92), "bc": (0.50, 0.92), "br": (0.92, 0.92),
+            }
+            points = {}
+            for key, (fx, fy) in sample_points.items():
+                x = max(0, min(img_w - 1, int(round((img_w - 1) * fx))))
+                y = max(0, min(img_h - 1, int(round((img_h - 1) * fy))))
+                color = image.pixelColor(x, y)
+                points[key] = {"x": x, "y": y, "rgba": [int(color.red()), int(color.green()), int(color.blue()), int(color.alpha())], "hex": color.name()}
+            info["points"] = points
+            step_x = max(1, img_w // 32)
+            step_y = max(1, img_h // 24)
+            total = 0
+            sum_r = sum_g = sum_b = sum_l = sum_l2 = 0.0
+            dark_samples = 0
+            mid_samples = 0
+            bright_samples = 0
+            accent_samples = 0
+            buckets = collections.Counter()
+            for y in range(step_y // 2, img_h, step_y):
+                for x in range(step_x // 2, img_w, step_x):
+                    color = image.pixelColor(x, y)
+                    r = int(color.red())
+                    g = int(color.green())
+                    b = int(color.blue())
+                    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                    total += 1
+                    sum_r += r
+                    sum_g += g
+                    sum_b += b
+                    sum_l += lum
+                    sum_l2 += lum * lum
+                    if lum < 35:
+                        dark_samples += 1
+                    if lum > 70:
+                        mid_samples += 1
+                    if lum > 145:
+                        bright_samples += 1
+                    if max(r, g, b) - min(r, g, b) > 48 and lum > 35:
+                        accent_samples += 1
+                    buckets[(r // 16 * 16, g // 16 * 16, b // 16 * 16)] += 1
+            if total:
+                avg_l = sum_l / total
+                variance = max(0.0, (sum_l2 / total) - (avg_l * avg_l))
+                top_count = buckets.most_common(1)[0][1] if buckets else 0
+                info["stats"] = {
+                    "samples": total,
+                    "avgRgb": [round(sum_r / total, 1), round(sum_g / total, 1), round(sum_b / total, 1)],
+                    "avgLum": round(avg_l, 1),
+                    "stdLum": round(math.sqrt(variance), 1),
+                    "darkSamples": int(dark_samples),
+                    "midSamples": int(mid_samples),
+                    "brightSamples": int(bright_samples),
+                    "accentSamples": int(accent_samples),
+                    "bucketCount": int(len(buckets)),
+                    "topCoverage": round(float(top_count) / float(total), 3),
+                    "top": [
+                        {"rgb16": "#%02x%02x%02x" % key, "count": int(count)}
+                        for key, count in buckets.most_common(8)
+                    ],
+                }
+        except Exception as exc:
+            info["error"] = str(exc)
+        return info
+
+    def _web_view_visual_blank_status(self, reason: str = "") -> dict:
+        status = {"reason": str(reason or ""), "blank": False}
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                status["probeFailed"] = True
+                status["error"] = "missing_web_view"
+                return status
+            info = self._ui_debug_widget_pixels("webView", web_view)
+            status["pixels"] = info
+            stats = info.get("stats") if isinstance(info, dict) else None
+            if not isinstance(stats, dict) or int(stats.get("samples", 0) or 0) <= 0:
+                status["probeFailed"] = True
+                return status
+            samples = max(1, int(stats.get("samples", 1) or 1))
+            avg_lum = float(stats.get("avgLum", 0.0) or 0.0)
+            std_lum = float(stats.get("stdLum", 0.0) or 0.0)
+            bright_fraction = float(stats.get("brightSamples", 0) or 0) / float(samples)
+            mid_fraction = float(stats.get("midSamples", 0) or 0) / float(samples)
+            accent_fraction = float(stats.get("accentSamples", 0) or 0) / float(samples)
+            top_coverage = float(stats.get("topCoverage", 0.0) or 0.0)
+            bucket_count = int(stats.get("bucketCount", 0) or 0)
+            # A healthy PROEKT1 page has bright text/accent pixels and noticeable
+            # luminance variance. The failure screenshot is the almost-uniform Qt
+            # rounded frame background: dark, low-contrast, and with no bright text.
+            blank = bool(
+                avg_lum < 55.0
+                and bright_fraction < 0.025
+                and accent_fraction < 0.035
+                and (
+                    (std_lum < 16.0 and mid_fraction < 0.18)
+                    or (std_lum < 22.0 and top_coverage > 0.42 and bucket_count <= 10)
+                )
+            )
+            status.update({
+                "probeFailed": False,
+                "blank": blank,
+                "avgLum": round(avg_lum, 2),
+                "stdLum": round(std_lum, 2),
+                "brightFraction": round(bright_fraction, 4),
+                "midFraction": round(mid_fraction, 4),
+                "accentFraction": round(accent_fraction, 4),
+                "topCoverage": round(top_coverage, 4),
+                "bucketCount": bucket_count,
+            })
+            self._ui_debug_log("web.visual_blank.check", status=status)
+        except Exception as exc:
+            status["probeFailed"] = True
+            status["error"] = str(exc)
+        return status
+
+    def _ui_debug_window_from_point(self, point: QPoint) -> dict:
+        data = {"point": self._ui_debug_point(point)}
+        if os.name != 'nt':
+            return data
+        try:
+            user32 = ctypes.windll.user32
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = wintypes.HWND
+            hwnd = int(user32.WindowFromPoint(wintypes.POINT(int(point.x()), int(point.y()))) or 0)
+            data["hwnd"] = self._ui_debug_hwnd(hwnd) if hwnd else None
+        except Exception as exc:
+            data["error"] = str(exc)
+        return data
+
+    def _ui_debug_native_visual_probe(self, label: str, include_tree: bool = False):
+        if not bool(getattr(self, '_ui_debug_deep', False)):
+            return
+        if not bool(getattr(self, '_ui_debug_enabled', False)):
+            return
+        try:
+            data = {"label": str(label)}
+            cw = self.centralWidget()
+            web_view = getattr(self, 'web_view', None)
+            overlay = getattr(self, '_lifecycle_overlay', None)
+            data["pixels"] = [
+                self._ui_debug_widget_pixels("main", self),
+                self._ui_debug_widget_pixels("central", cw),
+                self._ui_debug_widget_pixels("webView", web_view),
+                self._ui_debug_widget_pixels("overlay", overlay),
+            ]
+            hit_points = []
+            for widget_name, widget in (("main", self), ("webView", web_view)):
+                try:
+                    if widget is None:
+                        continue
+                    gp = widget.mapToGlobal(QPoint(0, 0))
+                    hit_points.append({"name": widget_name + ".center", "hit": self._ui_debug_window_from_point(QPoint(int(gp.x() + widget.width() // 2), int(gp.y() + widget.height() // 2)))})
+                    hit_points.append({"name": widget_name + ".topLeft", "hit": self._ui_debug_window_from_point(QPoint(int(gp.x() + 8), int(gp.y() + 8)))})
+                except Exception as exc:
+                    hit_points.append({"name": widget_name, "error": str(exc)})
+            data["hitTest"] = hit_points
+            if os.name == 'nt':
+                data["mainHwnd"] = self._ui_debug_hwnd(int(self.winId()))
+                if web_view is not None:
+                    web_hwnd = int(web_view.winId())
+                    data["webHwnd"] = self._ui_debug_hwnd(web_hwnd)
+                    if include_tree:
+                        data["webHwndTree"] = self._ui_debug_hwnd_tree(web_hwnd, max_children=40)
+            self._ui_debug_log("VISUAL", **data)
+        except Exception as exc:
+            self._ui_debug_log("VISUAL.error", label=str(label), error=str(exc))
+
+    def _ui_debug_mouse(self) -> dict:
+        data = {}
+        try:
+            data["qtButtons"] = int(QApplication.mouseButtons().value)
+        except Exception:
+            try:
+                data["qtButtons"] = str(QApplication.mouseButtons())
+            except Exception:
+                pass
+        if os.name == 'nt':
+            try:
+                user32 = ctypes.windll.user32
+                user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+                user32.GetAsyncKeyState.restype = ctypes.c_short
+                data["winLButtonDown"] = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+            except Exception as exc:
+                data["winMouseError"] = str(exc)
+        try:
+            data["nativeDragActive"] = bool(getattr(self, '_native_drag_active', False))
+        except Exception:
+            pass
+        return data
+
+    def _ui_debug_state(self, label: str, include_dom: bool = False):
+        if not bool(getattr(self, '_ui_debug_enabled', False)):
+            return
+        state = {"label": str(label)}
+        if not bool(getattr(self, '_ui_debug_deep', False)):
+            try:
+                g = self.geometry()
+                fg = self.frameGeometry()
+                web_view = getattr(self, 'web_view', None)
+                state.update({
+                    "deep": False,
+                    "window": {
+                        "geom": self._ui_debug_rect(g),
+                        "frameGeom": self._ui_debug_rect(fg),
+                        "size": {"w": int(self.width()), "h": int(self.height())},
+                        "min": {"w": int(self.minimumWidth()), "h": int(self.minimumHeight())},
+                        "fullscreen": bool(self.isFullScreen()),
+                    },
+                    "flags": {
+                        "dpiFit": float(getattr(self, '_dpi_fit_factor', 1.0)),
+                        "screenSurfaceRebuildPending": bool(getattr(self, '_screen_surface_rebuild_pending', False)),
+                        "nativeDragActive": bool(getattr(self, '_native_drag_active', False)),
+                        "webFullscreenActive": bool(getattr(self, '_web_fs_active', False)),
+                    },
+                    "mouse": self._ui_debug_mouse(),
+                    "screen": self._ui_debug_screen(self._current_window_screen()),
+                })
+                if web_view is not None:
+                    state["webView"] = {
+                        "geom": self._ui_debug_rect(web_view.geometry()),
+                        "rect": self._ui_debug_rect(web_view.rect()),
+                        "visible": bool(web_view.isVisible()),
+                        "hidden": bool(web_view.isHidden()),
+                        "dpr": float(web_view.devicePixelRatioF()),
+                        "zoom": float(web_view.zoomFactor()),
+                    }
+            except Exception as exc:
+                state["compactError"] = str(exc)
+            self._ui_debug_log("STATE", **state)
+            return
+        try:
+            g = self.geometry()
+            fg = self.frameGeometry()
+            center = g.center()
+            handle = self.windowHandle()
+            handle_screen = handle.screen() if handle is not None else None
+            center_screen = QApplication.screenAt(center)
+            state["window"] = {
+                "geom": self._ui_debug_rect(g),
+                "frameGeom": self._ui_debug_rect(fg),
+                "pos": self._ui_debug_point(self.pos()),
+                "size": {"w": int(self.width()), "h": int(self.height())},
+                "min": {"w": int(self.minimumWidth()), "h": int(self.minimumHeight())},
+                "visible": bool(self.isVisible()),
+                "fullscreen": bool(self.isFullScreen()),
+                "dpr": float(self.devicePixelRatioF()),
+                "winId": hex(int(self.winId())),
+                "center": self._ui_debug_point(center),
+            }
+            state["flags"] = {
+                "dpiFit": float(getattr(self, '_dpi_fit_factor', 1.0)),
+                "dpiTargetFit": float(getattr(self, '_dpi_target_fit_factor', 1.0)),
+                "screenSurfaceRebuildPending": bool(getattr(self, '_screen_surface_rebuild_pending', False)),
+                "nativeDragActive": bool(getattr(self, '_native_drag_active', False)),
+                "webFullscreenActive": bool(getattr(self, '_web_fs_active', False)),
+            }
+            state["mouse"] = self._ui_debug_mouse()
+            state["screen"] = {
+                "handle": self._ui_debug_screen(handle_screen),
+                "center": self._ui_debug_screen(center_screen),
+                "primary": self._ui_debug_screen(QApplication.primaryScreen()),
+                "all": [self._ui_debug_screen(s) for s in QApplication.screens()],
+            }
+            state["mainHwnd"] = self._ui_debug_hwnd(int(self.winId()))
+        except Exception as exc:
+            state["windowError"] = str(exc)
+        try:
+            cw = self.centralWidget()
+            if cw is not None:
+                state["central"] = {
+                    "geom": self._ui_debug_rect(cw.geometry()),
+                    "rect": self._ui_debug_rect(cw.rect()),
+                    "visible": bool(cw.isVisible()),
+                    "dpr": float(cw.devicePixelRatioF()),
+                }
+        except Exception as exc:
+            state["centralError"] = str(exc)
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is not None:
+                state["webView"] = {
+                    "geom": self._ui_debug_rect(web_view.geometry()),
+                    "rect": self._ui_debug_rect(web_view.rect()),
+                    "visible": bool(web_view.isVisible()),
+                    "hidden": bool(web_view.isHidden()),
+                    "dpr": float(web_view.devicePixelRatioF()),
+                    "zoom": float(web_view.zoomFactor()),
+                    "winId": hex(int(web_view.winId())),
+                }
+                state["webHwnd"] = self._ui_debug_hwnd(int(web_view.winId()))
+        except Exception as exc:
+            state["webError"] = str(exc)
+        self._ui_debug_log("STATE", **state)
+        if include_dom:
+            self._ui_debug_dom_probe(label)
+
+    def _ui_debug_dom_probe(self, label: str):
+        if not bool(getattr(self, '_ui_debug_deep', False)):
+            return
+        if not bool(getattr(self, '_ui_debug_enabled', False)):
+            return
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return
+            label_json = json.dumps(str(label), ensure_ascii=False)
+            script = r"""
+(function(){
+  const label = __LABEL__;
+  const rectOf = r => r ? ({x:r.x,y:r.y,w:r.width,h:r.height,r:r.right,b:r.bottom}) : null;
+  const cssPick = (cs) => cs ? ({
+    display:cs.display, visibility:cs.visibility, opacity:cs.opacity, position:cs.position,
+    left:cs.left, top:cs.top, width:cs.width, height:cs.height,
+    transform:cs.transform, transformOrigin:cs.transformOrigin,
+    background:cs.backgroundColor, clipPath:cs.clipPath, borderRadius:cs.borderRadius,
+    overflow:cs.overflow, zIndex:cs.zIndex
+  }) : null;
+  const win = document.getElementById('app-window');
+  const header = document.getElementById('header');
+  const body = document.body;
+  const root = document.documentElement;
+  const wcs = win ? getComputedStyle(win) : null;
+  const bcs = body ? getComputedStyle(body) : null;
+  const rcs = root ? getComputedStyle(root) : null;
+  return JSON.stringify({
+    label,
+    ts: performance.now(),
+    readyState: document.readyState,
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+    location: String(location.href),
+    viewport: {
+      innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+      outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+      visualViewport: window.visualViewport ? {w:window.visualViewport.width,h:window.visualViewport.height,scale:window.visualViewport.scale,offsetLeft:window.visualViewport.offsetLeft,offsetTop:window.visualViewport.offsetTop} : null,
+      dpr: window.devicePixelRatio,
+      screen: {w:screen.width,h:screen.height,availW:screen.availWidth,availH:screen.availHeight}
+    },
+    root: {
+      clientWidth: root ? root.clientWidth : null,
+      clientHeight: root ? root.clientHeight : null,
+      scrollWidth: root ? root.scrollWidth : null,
+      scrollHeight: root ? root.scrollHeight : null,
+      cssFit: rcs ? rcs.getPropertyValue('--proekt1-dpi-fit').trim() : null,
+      cssFitW: rcs ? rcs.getPropertyValue('--proekt1-dpi-fit-w').trim() : null,
+      cssFitH: rcs ? rcs.getPropertyValue('--proekt1-dpi-fit-h').trim() : null
+    },
+    body: body ? {
+      className: body.className,
+      rect: rectOf(body.getBoundingClientRect()),
+      offsetWidth: body.offsetWidth, offsetHeight: body.offsetHeight,
+      scrollWidth: body.scrollWidth, scrollHeight: body.scrollHeight,
+      inline: {background:body.style.background, zoom:body.style.zoom, transform:body.style.transform},
+      computed: cssPick(bcs)
+    } : null,
+    appWindow: win ? {
+      rect: rectOf(win.getBoundingClientRect()),
+      offsetWidth: win.offsetWidth, offsetHeight: win.offsetHeight,
+      clientWidth: win.clientWidth, clientHeight: win.clientHeight,
+      scrollWidth: win.scrollWidth, scrollHeight: win.scrollHeight,
+      inline: {left:win.style.left, top:win.style.top, width:win.style.width, height:win.style.height, transform:win.style.transform, opacity:win.style.opacity, display:win.style.display, visibility:win.style.visibility},
+      computed: cssPick(wcs)
+    } : null,
+    header: header ? {rect:rectOf(header.getBoundingClientRect()), inline:{left:header.style.left,top:header.style.top}, className:header.className} : null
+  });
+})()
+""".replace("__LABEL__", label_json)
+            def _done(result=None):
+                self._ui_debug_log("DOM", label=str(label), payload=result)
+            web_view.page().runJavaScript(script, _done)
+        except Exception as exc:
+            self._ui_debug_log("DOM.error", label=str(label), error=str(exc))
+
+    def _ui_debug_burst_tick(self, label: str, index: int):
+        if not bool(getattr(self, '_ui_debug_deep', False)):
+            return
+        tick_label = f"{label}.{index:02d}"
+        self._ui_debug_state(tick_label, include_dom=True)
+        self._ui_debug_native_visual_probe(tick_label, include_tree=index in (0, 1, 5, 15))
+
+    def _ui_debug_burst(self, label: str, count: int = 12, interval_ms: int = 250):
+        if not bool(getattr(self, '_ui_debug_deep', False)):
+            return
+        if not bool(getattr(self, '_ui_debug_enabled', False)):
+            return
+        try:
+            count = max(1, min(40, int(count)))
+            interval_ms = max(20, min(2000, int(interval_ms)))
+            self._ui_debug_log("BURST.schedule", label=str(label), count=count, intervalMs=interval_ms)
+            for index in range(count):
+                QTimer.singleShot(
+                    index * interval_ms,
+                    lambda idx=index: self._ui_debug_burst_tick(label, idx),
+                )
+        except Exception as exc:
+            self._ui_debug_log("BURST.error", label=str(label), error=str(exc))
+
     def _on_web_window_action(self, action: str):
+        action = str(action or "")
+        self._ui_debug_log("web.windowAction", action=action)
         if action == "minimize":
             self.showMinimized()
         elif action == "close":
             self.close()
+        elif action == "fullscreen":
+            self._set_web_fullscreen_active(not bool(getattr(self, '_web_fs_active', False)))
+        elif action == "fullscreen-enter":
+            self._set_web_fullscreen_active(True)
+        elif action == "fullscreen-exit":
+            self._set_web_fullscreen_active(False)
+        elif action == "drag":
+            self._start_native_window_drag()
+
+    def _is_left_mouse_button_down(self) -> bool:
+        if os.name == 'nt':
+            try:
+                user32 = ctypes.windll.user32
+                user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+                user32.GetAsyncKeyState.restype = ctypes.c_short
+                VK_LBUTTON = 0x01
+                return bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+            except Exception:
+                pass
+        try:
+            if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _poll_native_drag_release(self):
+        if not getattr(self, '_native_drag_active', False):
+            self._ui_debug_log("native_drag.poll.skip", reason="not_active", mouse=self._ui_debug_mouse())
+            return
+        if self._is_left_mouse_button_down():
+            self._ui_debug_log("native_drag.poll.still_down", mouse=self._ui_debug_mouse())
+            try:
+                if self._web_surface_needs_native_pin():
+                    now = time.monotonic()
+                    last_pin_at = float(getattr(self, '_native_drag_live_pin_at', 0.0) or 0.0)
+                    if now - last_pin_at >= 0.10:
+                        self._native_drag_live_pin_at = now
+                        # During the OS move, never resize the WebEngine native
+                        # chain live: that feeds physical DPR sizes back into Qt
+                        # geometry. On DPR>1 only repair the child-HWND origin.
+                        if self._web_view_live_native_pin_allowed():
+                            self._pin_web_view_native_chain_position_only(
+                                "native_drag.poll.still_down.high_dpi_position",
+                            )
+                        self._apply_web_view_native_round_rgn()
+            except Exception:
+                pass
+            QTimer.singleShot(80, self._poll_native_drag_release)
+            return
+        self._native_drag_active = False
+        self._ui_debug_state("native_drag.release_detected", include_dom=bool(getattr(self, '_ui_debug_deep', False)))
+        self._ui_debug_native_visual_probe("native_drag.release_detected", include_tree=True)
+        self._ui_debug_burst("native_drag.release_burst", count=16, interval_ms=200)
+        self._schedule_web_view_native_pin_repair("native_drag.release_detected", verify=True)
+        self._schedule_web_view_native_round_rgn_reapply("native_drag.release_detected")
+        try:
+            timer = getattr(self, '_dpi_refresh_debounce_timer', None)
+            if timer is not None:
+                timer.start(20)
+            elif getattr(self, '_screen_surface_rebuild_pending', False):
+                QTimer.singleShot(20, self._refresh_dpi_dependent_layout)
+        except Exception:
+            pass
+
+    def _start_native_window_drag(self):
+        if getattr(self, '_web_fs_active', False):
+            self._ui_debug_log("native_drag.start.skip", reason="fullscreen")
+            return
+        self._native_drag_active = True
+        self._native_drag_live_pin_at = 0.0
+        self._apply_web_view_native_round_rgn()
+        self._ui_debug_state("native_drag.start", include_dom=bool(getattr(self, '_ui_debug_deep', False)))
+        QTimer.singleShot(80, self._poll_native_drag_release)
+        try:
+            handle = self.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                self._ui_debug_log("native_drag.startSystemMove.ok")
+                return
+        except Exception:
+            pass
+        if os.name == 'nt':
+            try:
+                self._ui_debug_log("native_drag.fallback.win32.start")
+                hwnd = wintypes.HWND(int(self.winId()))
+                user32 = ctypes.windll.user32
+                user32.ReleaseCapture.argtypes = []
+                user32.ReleaseCapture.restype = wintypes.BOOL
+                user32.SendMessageW.argtypes = [
+                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                ]
+                user32.SendMessageW.restype = wintypes.LPARAM
+                WM_NCLBUTTONDOWN = 0x00A1
+                HTCAPTION = 2
+                user32.ReleaseCapture()
+                user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+                self._ui_debug_log("native_drag.fallback.win32.sent")
+            except Exception:
+                pass
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger or reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -8114,6 +11108,215 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
         except Exception:
             pass
 
+    def _sanitize_interface_scale_percent(self, value: Any, default: int = 100) -> int:
+        choices = (80, 100, 125, 150, 200)
+        try:
+            if isinstance(value, str):
+                raw = value.strip().replace('%', '').replace(',', '.')
+                parsed = float(raw)
+            else:
+                parsed = float(value)
+            if parsed > 0 and parsed <= 4:
+                parsed *= 100.0
+            percent = int(round(parsed))
+            return percent if percent in choices else (default if default in choices else 100)
+        except Exception:
+            return default if default in choices else 100
+
+    def _read_initial_interface_scale_percent(self) -> int:
+        try:
+            path = getattr(self, 'config_path', '')
+            if path and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return self._sanitize_interface_scale_percent(data.get("interface_scale", 100), 100)
+        except Exception:
+            pass
+        return 100
+
+    def _interface_scale_factor(self) -> float:
+        percent = self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)
+        return max(0.8, min(2.0, percent / 100.0))
+
+    def _requested_window_size(self) -> tuple[int, int]:
+        scale = self._interface_scale_factor()
+        return (
+            max(1, int(round(float(getattr(self, '_design_window_w', 1100)) * scale))),
+            max(1, int(round(float(getattr(self, '_design_window_h', 760)) * scale))),
+        )
+
+    def _scaled_window_size(self, fit_factor: float = 1.0) -> tuple[int, int]:
+        req_w, req_h = self._requested_window_size()
+        fit = max(0.25, min(1.0, float(fit_factor or 1.0)))
+        return max(1, int(round(req_w * fit))), max(1, int(round(req_h * fit)))
+
+    def _scaled_minimum_size(self, fit_factor: float = 1.0) -> tuple[int, int]:
+        scale = self._interface_scale_factor()
+        fit = max(0.25, min(1.0, float(fit_factor or 1.0)))
+        return (
+            max(1, int(round(float(getattr(self, '_design_min_w', 960)) * scale * fit))),
+            max(1, int(round(float(getattr(self, '_design_min_h', 660)) * scale * fit))),
+        )
+
+    def _web_engine_zoom_for_scale(self, factor: Optional[float] = None) -> float:
+        try:
+            ui_scale = max(0.8, min(2.0, float(self._interface_scale_factor())))
+            if ui_scale >= 0.999:
+                return max(1.0, min(2.0, ui_scale))
+            high_dpi = self._screen_dpi_scale() > 1.01
+            web_view = getattr(self, 'web_view', None)
+            if web_view is not None:
+                try:
+                    high_dpi = high_dpi or float(web_view.devicePixelRatioF()) > 1.01
+                except Exception:
+                    pass
+            if high_dpi:
+                return max(0.5, min(1.0, ui_scale))
+        except Exception:
+            pass
+        return 1.0
+
+    def _apply_fullscreen_interface_scale(self, reason: str = "interface.scale.fullscreen"):
+        """Apply UI scale while Web fullscreen keeps owning the window geometry."""
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return False
+            self._set_web_view_opaque_input_surface(str(reason or "interface.scale.fullscreen"))
+            self._apply_web_view_backing()
+            screen = self._current_window_screen()
+            try:
+                restore_fit = self._dpi_fit_factor_for_screen(screen)
+                min_w, min_h = self._scaled_minimum_size(restore_fit)
+                scaled_w, scaled_h = self._scaled_window_size(restore_fit)
+                target_w = max(min_w, scaled_w)
+                target_h = max(min_h, scaled_h)
+                self.setMinimumSize(min_w, min_h)
+                restore_geom = getattr(self, '_web_fs_restore_geometry', None)
+                center = restore_geom.center() if restore_geom is not None else self.geometry().center()
+                avail = screen.availableGeometry() if screen is not None else QApplication.primaryScreen().availableGeometry()
+                target_w = max(1, min(int(target_w), int(avail.width())))
+                target_h = max(1, min(int(target_h), int(avail.height())))
+                x = max(avail.left(), min(center.x() - target_w // 2, avail.right() - target_w + 1))
+                y = max(avail.top(), min(center.y() - target_h // 2, avail.bottom() - target_h + 1))
+                self._web_fs_restore_geometry = QRect(int(x), int(y), int(target_w), int(target_h))
+                self._ui_debug_log(
+                    "interface.scale.fullscreen.restore_geometry",
+                    reason=str(reason or ""),
+                    restoreFactor=float(restore_fit),
+                    min={"w": int(min_w), "h": int(min_h)},
+                    geometry=self._ui_debug_rect(self._web_fs_restore_geometry),
+                )
+            except Exception as exc:
+                self._ui_debug_log("interface.scale.fullscreen.restore_geometry.error", reason=str(reason or ""), error=str(exc))
+            cw = self.centralWidget()
+            rect = cw.rect() if cw is not None else self.rect()
+            if rect is not None and int(rect.width()) > 0 and int(rect.height()) > 0:
+                self._set_web_view_geometry_stable(
+                    rect,
+                    str(reason or "interface.scale.fullscreen"),
+                    sync_fit=False,
+                    reset_clip=False,
+                    raise_view=True,
+                )
+            fullscreen_fit = self._actual_web_fit_factor()
+            self._dpi_fit_factor = fullscreen_fit
+            self._dpi_target_fit_factor = fullscreen_fit
+            try:
+                frame = getattr(self, '_rounded_frame', None)
+                if frame is not None:
+                    frame.setScaleFactor(self._interface_scale_factor() * fullscreen_fit)
+            except Exception:
+                pass
+            try:
+                engine_zoom = self._web_engine_zoom_for_scale(fullscreen_fit)
+                prev_zoom = float(getattr(self, '_web_engine_zoom_factor', 1.0) or 1.0)
+                self._web_engine_zoom_factor = engine_zoom
+                if abs(prev_zoom - engine_zoom) > 1e-4:
+                    web_view.setZoomFactor(engine_zoom)
+            except Exception:
+                engine_zoom = 1.0
+            self._sync_web_dpi_fit_factor(fullscreen_fit, engine_zoom=engine_zoom)
+            self._sync_web_fullscreen_state(True)
+            if os.name == 'nt':
+                self._pin_web_view_native_chain(str(reason or "interface.scale.fullscreen") + ".now")
+                QTimer.singleShot(40, lambda reason=reason: self._pin_web_view_native_chain(str(reason or "interface.scale.fullscreen") + ".pin_40ms"))
+                QTimer.singleShot(140, lambda reason=reason: self._pin_web_view_native_chain(str(reason or "interface.scale.fullscreen") + ".pin_140ms"))
+            self._apply_web_view_native_round_rgn()
+            QTimer.singleShot(0, self._apply_web_view_native_round_rgn)
+            QTimer.singleShot(120, self._apply_web_view_native_round_rgn)
+            QTimer.singleShot(0, lambda: self._sync_web_fullscreen_state(True))
+            QTimer.singleShot(80, lambda: self._sync_web_fullscreen_state(True))
+            QTimer.singleShot(220, lambda: self._sync_web_fullscreen_state(True))
+            self._force_web_view_native_redraw()
+            self._ui_debug_state(str(reason or "interface.scale.fullscreen") + ".done", include_dom=True)
+            return True
+        except Exception as exc:
+            try:
+                self._ui_debug_log("interface.scale.fullscreen.error", reason=str(reason or ""), error=str(exc))
+            except Exception:
+                pass
+            return False
+
+    def _apply_interface_scale(self, resize_window: bool = True, previous_percent: Optional[int] = None):
+        try:
+            self._set_main_window_opaque_hit_surface("interface.scale.apply.start")
+            screen = self._current_window_screen()
+            self._ui_debug_log(
+                "interface.scale.apply",
+                percent=int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
+                factor=self._interface_scale_factor(),
+                resizeWindow=bool(resize_window),
+                previousPercent=previous_percent,
+                screen=self._ui_debug_screen(screen),
+            )
+            web_view = getattr(self, 'web_view', None)
+            web_visible = bool(web_view is not None and web_view.isVisible())
+            if getattr(self, '_web_fs_active', False):
+                self._apply_fullscreen_interface_scale("interface.scale.apply.fullscreen")
+                return
+            if web_visible:
+                self._set_web_view_opaque_input_surface("interface.scale.apply")
+                self._apply_web_view_backing()
+                try:
+                    next_engine_zoom = self._web_engine_zoom_for_scale()
+                    prev_engine_zoom = float(getattr(self, '_web_engine_zoom_factor', 1.0) or 1.0)
+                    self._web_engine_zoom_factor = next_engine_zoom
+                    if abs(prev_engine_zoom - next_engine_zoom) > 1e-4:
+                        self._ui_debug_log(
+                            "interface.scale.pre_web_engine_zoom",
+                            fromZoom=prev_engine_zoom,
+                            toZoom=next_engine_zoom,
+                            uiScale=self._interface_scale_factor(),
+                        )
+                        web_view.setZoomFactor(next_engine_zoom)
+                except Exception as exc:
+                    try:
+                        self._ui_debug_log("interface.scale.pre_web_engine_zoom.error", error=str(exc))
+                    except Exception:
+                        pass
+            if web_visible and self._web_surface_needs_native_pin():
+                self._suppress_web_view_native_round_rgn("interface.scale.apply", ms=520)
+            self._apply_dpi_window_metrics(screen, resize_window=resize_window)
+            if screen is not None and not self.isFullScreen():
+                avail = screen.availableGeometry()
+                g = self.geometry()
+                x = max(avail.left(), min(g.x(), avail.right() - g.width()))
+                y = max(avail.top(), min(g.y(), avail.bottom() - g.height()))
+                if x != g.x() or y != g.y():
+                    self.move(x, y)
+            self._sync_actual_web_fit_factor()
+            if web_visible:
+                self._reset_web_view_clip()
+            self._apply_rounded_mask()
+            if web_visible:
+                self._schedule_web_view_native_pin_repair("interface.scale.apply", verify=True)
+                self._schedule_web_view_native_round_rgn_reapply("interface.scale.apply")
+                self._schedule_interface_scale_surface_recovery("interface.scale.apply")
+                self._schedule_interface_scale_post_repaint("interface.scale.apply", previous_percent=previous_percent)
+        except Exception:
+            pass
+
     def ensure_visible(self):
         """Гарантирует, что окно видимо на каком-либо мониторе и умещается в его рабочую область."""
         try:
@@ -8129,12 +11332,14 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             if screen is None:
                 # Окно полностью вне экранов — переместить на основной
                 screen = QApplication.primaryScreen()
+                self._apply_dpi_window_metrics(screen, resize_window=True)
                 avail = screen.availableGeometry()
-                self.resize(min(1100, avail.width() - 40), min(760, avail.height() - 40))
                 g = self.geometry()
                 center = avail.center()
                 self.move(center.x() - g.width() // 2, center.y() - g.height() // 2)
                 return
+            self._apply_dpi_window_metrics(screen, resize_window=False)
+            g = self.geometry()
             avail = screen.availableGeometry()
             # Подгоняем размер окна под рабочую область экрана
             new_w = max(self.minimumWidth(), min(g.width(), avail.width()))
@@ -8147,6 +11352,187 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             y = max(avail.top(), min(g.y(), avail.bottom() - g.height()))
             if x != g.x() or y != g.y():
                 self.move(x, y)
+        except Exception:
+            pass
+
+    def _screen_dpi_scale(self, screen=None) -> float:
+        scale = 1.0
+        try:
+            if screen is None:
+                screen = self._current_window_screen()
+            if screen is not None:
+                try:
+                    scale = max(scale, float(screen.devicePixelRatio()))
+                except Exception:
+                    pass
+                try:
+                    scale = max(scale, float(screen.logicalDotsPerInch()) / 96.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return max(1.0, min(4.0, scale))
+
+    def _dpi_fit_factor_for_screen(self, screen=None) -> float:
+        try:
+            if screen is None:
+                screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else QApplication.primaryScreen().availableGeometry()
+            req_w, req_h = self._requested_window_size()
+            by_w = max(0.25, max(1, avail.width()) / float(req_w))
+            by_h = max(0.25, max(1, avail.height()) / float(req_h))
+            # Qt/Chromium already account for the monitor DPR. Forcing an extra
+            # 1/DPR shrink after screenChanged collapses the WebEngine surface on
+            # mixed-DPI Windows, so only fit to the available logical work area.
+            return max(0.25, min(1.0, by_w, by_h))
+        except Exception:
+            return 1.0
+
+    def _actual_web_fit_factor(self) -> float:
+        try:
+            design_w, design_h = self._requested_window_size()
+            web_view = getattr(self, 'web_view', None)
+            cw = self.centralWidget()
+            web_visible = False
+            try:
+                web_visible = bool(web_view is not None and web_view.isVisible())
+            except Exception:
+                web_visible = False
+            if web_view is not None and not web_visible and web_view.width() > 1 and web_view.height() > 1:
+                width = int(web_view.width())
+                height = int(web_view.height())
+            elif cw is not None and cw.width() > 1 and cw.height() > 1:
+                width = int(cw.width())
+                height = int(cw.height())
+            elif web_view is not None and web_view.width() > 1 and web_view.height() > 1:
+                width = int(web_view.width())
+                height = int(web_view.height())
+            else:
+                width = max(1, int(self.width()))
+                height = max(1, int(self.height()))
+            by_w = width / float(design_w)
+            by_h = height / float(design_h)
+            return max(0.25, min(1.0, by_w, by_h))
+        except Exception:
+            return max(0.25, min(1.0, float(getattr(self, '_dpi_fit_factor', 1.0) or 1.0)))
+
+    def _sync_actual_web_fit_factor(self) -> float:
+        factor = self._actual_web_fit_factor()
+        self._dpi_fit_factor = factor
+        self._ui_debug_log(
+            "dpi.sync_actual_web_fit_factor",
+            factor=factor,
+            window={"w": int(self.width()), "h": int(self.height())},
+            web={"w": int(getattr(getattr(self, 'web_view', None), 'width', lambda: 0)()), "h": int(getattr(getattr(self, 'web_view', None), 'height', lambda: 0)())} if getattr(self, 'web_view', None) is not None else None,
+        )
+        try:
+            frame = getattr(self, '_rounded_frame', None)
+            if frame is not None:
+                frame.setScaleFactor(self._interface_scale_factor() * factor)
+        except Exception:
+            pass
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is not None:
+                engine_zoom = self._web_engine_zoom_for_scale(factor)
+                prev_zoom = float(getattr(self, '_web_engine_zoom_factor', 1.0) or 1.0)
+                self._web_engine_zoom_factor = engine_zoom
+                if abs(prev_zoom - engine_zoom) > 1e-4:
+                    self._ui_debug_log("dpi.web_engine_zoom", fromZoom=prev_zoom, toZoom=engine_zoom, factor=factor, uiScale=self._interface_scale_factor())
+                    web_view.setZoomFactor(engine_zoom)
+                self._sync_web_dpi_fit_factor(factor, engine_zoom=engine_zoom)
+        except Exception:
+            pass
+        return factor
+
+    def _apply_dpi_window_metrics(self, screen=None, resize_window: bool = False):
+        if getattr(self, '_web_fs_active', False):
+            self._ui_debug_log("dpi.apply.skip", reason="fullscreen", resizeWindow=bool(resize_window))
+            return
+        # Re-entry guard: resize() inside this method can trigger screenChanged /
+        # availableGeometryChanged which would recursively call us back. Without a
+        # guard, dragging the window across a monitor boundary spams setGeometry
+        # in an infinite loop (visible in logs as repeating "Unable to set geometry…").
+        if getattr(self, '_dpi_apply_in_progress', False):
+            self._ui_debug_log("dpi.apply.skip", reason="reentry", resizeWindow=bool(resize_window))
+            return
+        self._dpi_apply_in_progress = True
+        try:
+            before = {"w": int(self.width()), "h": int(self.height()), "minW": int(self.minimumWidth()), "minH": int(self.minimumHeight())}
+            target_factor = self._dpi_fit_factor_for_screen(screen)
+            self._dpi_target_fit_factor = target_factor
+            min_w, min_h = self._scaled_minimum_size(target_factor)
+            scaled_w, scaled_h = self._scaled_window_size(target_factor)
+            target_w = max(min_w, scaled_w)
+            target_h = max(min_h, scaled_h)
+            self._ui_debug_log(
+                "dpi.apply.start",
+                resizeWindow=bool(resize_window), screen=self._ui_debug_screen(screen),
+                before=before, targetFactor=target_factor,
+                uiScale=self._interface_scale_factor(),
+                target={"w": target_w, "h": target_h}, min={"w": min_w, "h": min_h},
+            )
+            # Always lower minimum FIRST so a subsequent resize to a smaller size is not
+            # clamped by the old (larger) minimum. Then raise it back after the resize.
+            self.setMinimumSize(min(min_w, self.minimumWidth()), min(min_h, self.minimumHeight()))
+            if resize_window and (self.width() != target_w or self.height() != target_h):
+                self._ui_debug_log("dpi.apply.resize", fromSize={"w": int(self.width()), "h": int(self.height())}, toSize={"w": target_w, "h": target_h})
+                self.resize(target_w, target_h)
+            self.setMinimumSize(min_w, min_h)
+            self._sync_actual_web_fit_factor()
+            self._ui_debug_state("dpi.apply.done", include_dom=True)
+        except Exception:
+            pass
+        finally:
+            self._dpi_apply_in_progress = False
+
+    def _sync_web_dpi_fit_factor(self, factor: Optional[float] = None, engine_zoom: Optional[float] = None):
+        try:
+            web_view = getattr(self, 'web_view', None)
+            if web_view is None:
+                return
+            if factor is None:
+                factor = self._actual_web_fit_factor()
+            factor = max(0.25, min(1.0, float(factor)))
+            ui_scale = max(0.8, min(2.0, float(self._interface_scale_factor())))
+            if engine_zoom is None:
+                engine_zoom = self._web_engine_zoom_for_scale(factor)
+            engine_zoom = max(0.5, min(2.0, float(engine_zoom or 1.0)))
+            engine_absorbs_ui = (
+                (ui_scale >= 0.999 and abs(float(engine_zoom) - float(ui_scale)) <= 1e-3)
+                or (ui_scale < 0.999 and engine_zoom < 0.999)
+            )
+            if engine_absorbs_ui:
+                css_zoom = 1.0
+                css_fit = factor
+                scale_mode = "engine"
+            else:
+                css_zoom = ui_scale if ui_scale >= 1.0 else 1.0
+                css_fit = factor if ui_scale >= 1.0 else max(0.25, min(1.0, factor * ui_scale))
+                scale_mode = "css_zoom" if ui_scale >= 1.0 else "transform"
+            effective_scale = max(0.25, min(4.0, css_zoom * css_fit))
+            visual_scale = max(0.25, min(4.0, engine_zoom * effective_scale))
+            fit_w = f"{float(getattr(self, '_design_window_w', 1100)):.6f}px"
+            fit_h = f"{float(getattr(self, '_design_window_h', 760)):.6f}px"
+            self._ui_debug_log("dpi.sync_web_css", factor=factor, uiScale=ui_scale, engineZoom=engine_zoom, cssZoom=css_zoom, cssFit=css_fit, effective=effective_scale, visual=visual_scale, scaleMode=scale_mode)
+            # Mark forced down-fit cases; normal >=100% UI scale is handled by page zoom.
+            dpi_class_js = (
+                "document.body.classList.add('dpi-fit-active');"
+                if css_fit < 0.999
+                else "document.body.classList.remove('dpi-fit-active');"
+            )
+            web_view.page().runJavaScript(
+                dpi_class_js
+                + "document.documentElement.style.setProperty('--proekt1-ui-scale', "
+                f"{json.dumps(f'{css_zoom:.6f}')});"
+                + "document.documentElement.style.setProperty('--proekt1-dpi-fit', "
+                f"{json.dumps(f'{css_fit:.6f}')});"
+                + "document.documentElement.style.setProperty('--proekt1-dpi-fit-w', "
+                f"{json.dumps(fit_w)});"
+                + "document.documentElement.style.setProperty('--proekt1-dpi-fit-h', "
+                f"{json.dumps(fit_h)});"
+                + "window.dispatchEvent(new Event('resize'));"
+            )
         except Exception:
             pass
 
@@ -8172,44 +11558,108 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             pass
 
     def _on_screen_dpi_changed(self, *args):
+        # Debounce: collapse rapid bursts of screen DPI/geometry change signals
+        # (Qt emits several per cross-monitor drag) into a single deferred refresh
+        # that fires AFTER the mouse button is released and the window has settled.
         try:
-            QTimer.singleShot(0, self._refresh_dpi_dependent_layout)
-            QTimer.singleShot(120, self._refresh_dpi_dependent_layout)
+            self._ui_debug_log("screen.dpi_or_geometry_changed", args=[str(a) for a in args])
+            timer = getattr(self, '_dpi_refresh_debounce_timer', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._refresh_dpi_dependent_layout)
+                self._dpi_refresh_debounce_timer = timer
+            timer.start(200)
         except Exception:
             pass
 
     def _refresh_dpi_dependent_layout(self):
+        # If the user is still dragging the window (left mouse button held),
+        # postpone the refresh — resizing/moving mid-drag fights the OS drag
+        # operation and causes the geometry feedback loop seen in the logs.
         try:
+            self._ui_debug_state("dpi.refresh.enter", include_dom=True)
+            if getattr(self, '_native_drag_active', False) or self._is_left_mouse_button_down():
+                self._ui_debug_log("dpi.refresh.defer", reason="mouse_or_native_drag_active", mouse=self._ui_debug_mouse())
+                timer = getattr(self, '_dpi_refresh_debounce_timer', None)
+                if timer is not None:
+                    timer.start(200)
+                return
+        except Exception:
+            pass
+        try:
+            screen = self._current_window_screen()
+            prev_factor = float(getattr(self, '_dpi_fit_factor', 1.0))
+            pending_surface_rebuild = bool(getattr(self, '_screen_surface_rebuild_pending', False))
+            self._ui_debug_log("dpi.refresh.apply_begin", screen=self._ui_debug_screen(screen), prevFactor=prev_factor, pendingSurfaceRebuild=pending_surface_rebuild)
+            # A monitor/DPI refresh must not resize the top-level window after
+            # an OS drag release: that visible 1088x752 <-> 1100x760 correction
+            # is the small frame "jump" seen when crossing monitors.
+            self._apply_dpi_window_metrics(screen, resize_window=False)
+            new_factor = float(getattr(self, '_dpi_fit_factor', 1.0))
             cw = self.centralWidget()
             web_view = getattr(self, 'web_view', None)
             if cw is not None and web_view is not None:
-                web_view.setGeometry(cw.rect())
-                self._reset_web_view_clip()
-                web_view.raise_()
-            self.ensure_visible()
+                self._set_web_view_geometry_stable(cw.rect(), "dpi.refresh.after_metrics", sync_fit=True)
+            # NOTE: ensure_visible() intentionally NOT called here — it performs its
+            # own resize+move which, combined with screenChanged callbacks, was the
+            # source of the infinite setGeometry loop during cross-monitor drag.
+            # ensure_visible() is still called from showEvent and screenChanged.
             self._apply_rounded_mask()
+            self._ui_debug_state("dpi.refresh.after_layout", include_dom=True)
+            # Heavy native redraw + Chromium surface kicks are EXPENSIVE (each spawns
+            # multiple GPU surface rebuilds). Run them after a real screenChanged event
+            # or when the DPI factor changed; skip same-monitor startup/layout refreshes.
+            if pending_surface_rebuild or abs(new_factor - prev_factor) > 1e-3:
+                self._screen_surface_rebuild_pending = False
+                try:
+                    self._ui_debug_log("dpi.refresh.surface_rebuild_schedule", prevFactor=prev_factor, newFactor=new_factor, pendingSurfaceRebuild=pending_surface_rebuild)
+                    # One heavy rebuild is needed right after the final resize lands:
+                    # it wakes Chromium's mixed-DPI surface. Do not schedule delayed
+                    # repaint/rebuild kicks here; on DPR=2 even the late opacity nudge
+                    # can blank an already recovered Chromium surface again.
+                    self._force_web_view_surface_rebuild()
+                except Exception:
+                    pass
+            elif self._web_surface_needs_native_pin():
+                self._schedule_web_view_native_pin_repair("dpi.refresh.high_dpi_no_rebuild", verify=False)
+                self._schedule_web_view_native_round_rgn_reapply("dpi.refresh.high_dpi_no_rebuild")
+            self._schedule_interface_scale_surface_recovery("dpi.refresh.interface_scale")
         except Exception:
             pass
 
     def _on_screen_changed(self, screen):
         """Вызывается Qt при перетаскивании окна на монитор с другим DPI.
-        Подгоняет размер и позицию окна под новый экран."""
+        Подгоняет размер и позицию окна под новый экран.
+
+        НИЧЕГО не делает во время активного drag — вызов resize/move внутри
+        обработчика конфликтует с OS-drag и порождает петлю setGeometry. Реальная
+        адаптация под новый экран выполняется отложенно через debounce-таймер.
+        """
         try:
             if screen is None:
                 return
+            self._ui_debug_state("screen.changed.before", include_dom=True)
+            self._ui_debug_log("screen.changed", screen=self._ui_debug_screen(screen))
+            self._ui_debug_burst("screen.changed_burst", count=16, interval_ms=200)
+            self._screen_surface_rebuild_pending = True
+            self._suppress_web_view_native_round_rgn("screen.changed", ms=1000)
+            self._sync_actual_web_fit_factor()
+            if getattr(self, '_native_drag_active', False) or self._is_left_mouse_button_down():
+                # Keep the old DPR=1 path pin-free during OS drag, but repair the
+                # DPR>1 WebEngine child HWND origin immediately. Do not resize it
+                # live: resizing here caused 1375 -> 2750 -> 5500 feedback.
+                if self._web_view_live_native_pin_allowed(screen):
+                    self._pin_web_view_native_chain_position_only(
+                        "screen.changed.live_high_dpi_position",
+                    )
+                self._apply_web_view_native_round_rgn()
             self._connect_screen_dpi_signals(screen)
-            avail = screen.availableGeometry()
-            g = self.geometry()
-            new_w = max(self.minimumWidth(), min(g.width(), avail.width()))
-            new_h = max(self.minimumHeight(), min(g.height(), avail.height()))
-            if new_w != g.width() or new_h != g.height():
-                self.resize(new_w, new_h)
-            g = self.geometry()
-            x = max(avail.left(), min(g.x(), avail.right() - g.width()))
-            y = max(avail.top(), min(g.y(), avail.bottom() - g.height()))
-            if x != g.x() or y != g.y():
-                self.move(x, y)
-            self._refresh_dpi_dependent_layout()
+            # Defer everything to the debounced refresh path. This single entry point
+            # also handles cross-DPI resize, web-view surface kick (scheduled INSIDE
+            # _refresh_dpi_dependent_layout AFTER resize lands), and rounded mask —
+            # but only AFTER the drag ends (mouse button released).
+            self._on_screen_dpi_changed()
         except Exception:
             pass
 
@@ -8479,8 +11929,17 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 self.keep_led_on_disconnected = data.get("keep_led_on_disconnected", False)
                 self.loop_protection_enabled = data.get("loop_protection", False)
                 self.purge_on_shutdown_enabled = data.get("purge_on_shutdown", False)
-                self.brightness = int(data.get("brightness", 255) or 255)
-                self.oled_brightness = int(data.get("oled_brightness", 207) or 207)
+                try:
+                    self.brightness = int(data.get("brightness", 255))
+                except Exception:
+                    self.brightness = 255
+                self.brightness = max(0, min(255, self.brightness))
+                try:
+                    self.oled_brightness = int(data.get("oled_brightness", 207))
+                except Exception:
+                    self.oled_brightness = 207
+                self.oled_brightness = max(0, min(255, self.oled_brightness))
+                self.interface_scale_percent = self._sanitize_interface_scale_percent(data.get("interface_scale", 100), 100)
                 transport_choice = data.get("transport", self.transport)
                 if transport_choice not in ("BLE", "USB"):
                     transport_choice = "BLE"
@@ -8585,6 +12044,7 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
             self.oled_brightness = 207
             self.app_language = "RU"
             self.theme = "violet"
+            self.interface_scale_percent = 100
 
     def save_app_config(self):
         try:
@@ -8649,14 +12109,15 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                     "keep_led_on_disconnected": self.keep_led_on_disconnected,
                     "loop_protection": self.loop_protection_enabled,
                     "purge_on_shutdown": self.purge_on_shutdown_enabled,
-                    "brightness": int(self.brightness),
+                    "brightness": int(max(0, min(255, int(self.brightness)))),
                     "transport": self.transport,
                     "led_profiles": self.led_profiles,
-                    "oled_brightness": int(getattr(self, 'oled_brightness', 207) or 207),
+                    "oled_brightness": int(max(0, min(255, int(getattr(self, 'oled_brightness', 207))))),
                     "delay_on_seconds": int(self.delay_on_seconds) if hasattr(self, 'delay_on_seconds') else 0,
                     "delay_off_seconds": int(self.delay_off_seconds) if hasattr(self, 'delay_off_seconds') else 0,
                     "app_language": getattr(self, 'app_language', 'RU'),
                     "display_lang": getattr(self, 'display_lang', 'RU'),
+                    "interface_scale": int(self._sanitize_interface_scale_percent(getattr(self, 'interface_scale_percent', 100), 100)),
                     "theme": getattr(self, 'theme', 'violet')
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -8805,9 +12266,14 @@ class MainWindow(QMainWindow, FramelessWindowMixin):
                 except Exception:
                     pass
                 try:
+                    self._rounded_frame.setTheme(new_theme)
+                except Exception:
+                    pass
+                try:
                     self._lifecycle_overlay.setTheme(new_theme)
                 except Exception:
                     pass
+                self._set_main_window_opaque_hit_surface("settings_dialog.theme")
                 self._update_web_fullscreen_theme(new_theme)
                 try:
                     QMessageBox.information(
